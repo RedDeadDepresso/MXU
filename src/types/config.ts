@@ -127,6 +127,7 @@ export interface AppSettings {
   welcomeShownHash?: string; // 已显示过的 welcome 内容 hash，用于判断内容变化时重新弹窗
   rightPanelWidth?: number; // 右侧面板宽度
   rightPanelCollapsed?: boolean; // 右侧面板是否折叠
+  addTaskPanelHeight?: number; // 添加任务面板高度
   devMode?: boolean; // 开发模式，启用后允许 F5 刷新 UI
   onboardingCompleted?: boolean; // 新用户引导是否已完成
   hotkeys?: HotkeySettings; // 快捷键设置
@@ -169,6 +170,23 @@ export const defaultMirrorChyanSettings: MirrorChyanSettings = {
 
 // 默认截图帧率
 export const defaultScreenshotFrameRate: ScreenshotFrameRate = '1';
+
+// 添加任务面板高度约束
+export const addTaskPanelHeightMin = 100;
+export const addTaskPanelHeightMax = 600;
+export const defaultAddTaskPanelHeight = 192;
+export const addTaskPanelResizeStep = 24;
+
+export function clampAddTaskPanelHeight(value: number): number {
+  return Math.max(addTaskPanelHeightMin, Math.min(addTaskPanelHeightMax, value));
+}
+
+export function normalizeAddTaskPanelHeight(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return defaultAddTaskPanelHeight;
+  }
+  return clampAddTaskPanelHeight(value);
+}
 
 // 默认强调色
 export const defaultAccentColor: AccentColor = 'emerald';

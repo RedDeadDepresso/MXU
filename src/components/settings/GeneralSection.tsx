@@ -15,7 +15,7 @@ import {
 
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '@/stores/appStore';
-import { defaultWindowSize } from '@/types/config';
+import { defaultAddTaskPanelHeight, defaultWindowSize } from '@/types/config';
 import { isTauri } from '@/utils/paths';
 import { SwitchButton } from '@/components/FormControls';
 import { FrameRateSelector } from '../FrameRateSelector';
@@ -31,6 +31,7 @@ export function GeneralSection() {
     setMinimizeToTray,
     setRightPanelWidth,
     setRightPanelCollapsed,
+    setAddTaskPanelHeight,
     instances,
     autoStartInstanceId,
     setAutoStartInstanceId,
@@ -119,10 +120,11 @@ export function GeneralSection() {
 
       setRightPanelWidth(320);
       setRightPanelCollapsed(false);
+      setAddTaskPanelHeight(defaultAddTaskPanelHeight);
     } catch {
       // ignore
     }
-  }, [setRightPanelWidth, setRightPanelCollapsed]);
+  }, [setRightPanelWidth, setRightPanelCollapsed, setAddTaskPanelHeight]);
 
   // 构建下拉选项列表
   const dropdownOptions = [

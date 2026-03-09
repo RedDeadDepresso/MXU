@@ -461,6 +461,8 @@ export default {
     collapse: 'Collapse panel',
     specialTasks: 'Special Tasks',
     allSpecialTasksAdded: 'All added',
+    ungroupedTasks: 'Others',
+    resizeHandleAriaLabel: 'Resize add task panel height',
   },
 
   // About

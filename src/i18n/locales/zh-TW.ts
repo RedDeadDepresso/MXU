@@ -452,6 +452,8 @@ export default {
     specialTasks: '特殊任務',
     allSpecialTasksAdded: '已全部新增',
     collapse: '收起面板',
+    ungroupedTasks: '其他',
+    resizeHandleAriaLabel: '調整新增任務面板高度',
   },
 
   // 關於
