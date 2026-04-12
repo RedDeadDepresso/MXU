@@ -486,10 +486,10 @@ export const maaService = {
    */
   async postClick(instanceId: string, x: number, y: number): Promise<number> {
     if (!isTauri()) {
-      const result = await apiPost<{ clickId: number }>(
-        `/maa/instances/${instanceId}/click`,
-        { x, y },
-      );
+      const result = await apiPost<{ clickId: number }>(`/maa/instances/${instanceId}/click`, {
+        x,
+        y,
+      });
       return result.clickId;
     }
     return await invoke<number>('maa_post_click', { instanceId, x, y });
