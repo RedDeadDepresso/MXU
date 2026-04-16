@@ -315,8 +315,6 @@ export default {
     preActionConnectDelay: 'Waiting {{seconds}} seconds before connecting...',
     autoPreActionName: '▶️ Launch {{name}}',
     autoPreActionAdded: 'Auto-added pre-action: {{name}} (disabled by default)',
-    autoKillTaskName: '⛔ Kill {{name}}',
-    autoKillTaskAdded: 'Auto-added kill process task: {{name}} (disabled by default)',
     removeConfirmTitle: 'Delete pre-action',
     removeConfirmMessage: 'Are you sure you want to delete this pre-action?',
   },

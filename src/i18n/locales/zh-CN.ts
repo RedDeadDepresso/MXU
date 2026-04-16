@@ -307,8 +307,6 @@ export default {
     preActionConnectDelay: '等待 {{seconds}} 秒后连接...',
     autoPreActionName: '▶️ 启动 {{name}}',
     autoPreActionAdded: '已自动添加前置程序: {{name}}（默认未启用）',
-    autoKillTaskName: '⛔ 结束 {{name}}',
-    autoKillTaskAdded: '已自动添加结束进程任务: {{name}}（默认未启用）',
     removeConfirmTitle: '删除前置程序',
     removeConfirmMessage: '确定要删除这个前置程序吗？',
   },

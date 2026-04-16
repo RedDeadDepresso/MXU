@@ -307,8 +307,6 @@ export default {
     preActionConnectDelay: '{{seconds}}초 후 연결합니다...',
     autoPreActionName: '▶️ {{name}} 실행',
     autoPreActionAdded: '전처리 프로그램 자동 추가: {{name}} (기본적으로 비활성화)',
-    autoKillTaskName: '⛔ {{name}} 종료',
-    autoKillTaskAdded: '프로세스 종료 작업 자동 추가: {{name}} (기본적으로 비활성화)',
     removeConfirmTitle: '전처리 프로그램 삭제',
     removeConfirmMessage: '이 전처리 프로그램을 삭제하시겠습니까?',
   },

@@ -251,7 +251,7 @@ export interface AppState {
   // 设备信息保存
   setInstanceSavedDevice: (instanceId: string, savedDevice: SavedDeviceInfo) => void;
 
-  addPreAction: (instanceId: string, action: ActionConfig) => void;
+  addPreAction: (instanceId: string, action: ActionConfig, dedup?: { field: 'program'; value: string }) => boolean;
   updatePreAction: (instanceId: string, actionId: string, updates: Partial<ActionConfig>) => void;
   removePreAction: (instanceId: string, actionId: string) => void;
   reorderPreActions: (instanceId: string, oldIndex: number, newIndex: number) => void;
