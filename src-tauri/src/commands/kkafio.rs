@@ -1,6 +1,6 @@
 //! KKAFIO process management commands
 //!
-//! Spawns kkafio_cli.exe (or kkafio_cli.py) as a child process, pipes its
+//! Spawns kkafio_cli.exe (or kkafio_cli.py via `uv run`) as a child process, pipes its
 //! stdout/stderr line-by-line to the frontend via the `kkafio-output` Tauri
 //! event, and exposes start/stop commands.
 
@@ -50,7 +50,7 @@ fn emit_line(app: &tauri::AppHandle, stream: &str, line: &str) {
 }
 
 /// Resolve which executable + args to use.
-/// Priority: kkafio_cli.exe > kkafio_cli.py (via sys Python).
+/// Priority: kkafio_cli.exe > kkafio_cli.py (via `uv run`).
 /// Returns (program, args) or an error string.
 fn resolve_cli(cwd: &str) -> Result<(String, Vec<String>), String> {
     let exe = Path::new(cwd).join("kkafio_cli.exe");
@@ -60,12 +60,16 @@ fn resolve_cli(cwd: &str) -> Result<(String, Vec<String>), String> {
 
     let script = Path::new(cwd).join("kkafio_cli.py");
     if script.exists() {
-        // Use the Python interpreter that is on PATH.
-        // -u disables output buffering so lines arrive in real time.
-        let py = if cfg!(windows) { "python" } else { "python3" };
+        // Use `uv run` so the correct virtualenv and all dependencies are
+        // active regardless of what Python is on PATH.
+        // -q suppresses uv's own output so only the CLI's stdout/stderr
+        // reaches the log panel.
         return Ok((
-            py.to_string(),
+            "uv".to_string(),
             vec![
+                "run".into(),
+                "--quiet".into(),
+                "python".into(),
                 "-u".into(),
                 script.to_string_lossy().into_owned(),
                 "run".into(),
