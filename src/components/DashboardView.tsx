@@ -24,18 +24,15 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useAppStore } from '@/stores/appStore';
-import { maaService } from '@/services/maaService';
+
 import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu';
 import { FrameRateSelector, getFrameInterval } from './FrameRateSelector';
 import { resolveI18nText } from '@/services/contentResolver';
-import { loggers, generateTaskPipelineOverride } from '@/utils';
-import type { TaskConfig } from '@/types/maa';
-import { normalizeAgentConfigs } from '@/types/interface';
+import { loggers } from '@/utils';
 import { getInterfaceLangKey } from '@/i18n';
-import { getMxuSpecialTask } from '@/types/specialTasks';
-import { startGlobalCallbackListener } from '@/components/connection/callbackCache';
+
 import { stopInstanceTasks } from '@/services/taskStopService';
-import { buildPiEnvVars } from '@/utils/piEnv';
+
 
 const log = loggers.ui;
 
@@ -54,7 +51,6 @@ function InstanceCard({ instanceId, instanceName, isActive, onSelect }: Instance
     instanceTaskStatus,
     instanceScreenshotStreaming,
     setInstanceScreenshotStreaming,
-    setInstanceConnectionStatus,
     projectInterface,
     selectedController,
     selectedResource,
@@ -73,8 +69,6 @@ function InstanceCard({ instanceId, instanceName, isActive, onSelect }: Instance
     registerEntryTaskName,
     screenshotFrameRate,
     setShowAddTaskPanel,
-    tcpCompatMode,
-    maaVersion,
   } = useAppStore();
 
   const langKey = getInterfaceLangKey(language);
@@ -107,11 +101,6 @@ function InstanceCard({ instanceId, instanceName, isActive, onSelect }: Instance
   const tasks = instance?.selectedTasks || [];
   const enabledTasks = tasks.filter((t) => t.enabled);
   const canRun = isConnected && isResourceLoaded && enabledTasks.length > 0;
-
-  // 获取当前控制器和资源名（用于 pipeline override 生成）
-  const currentControllerName =
-    selectedController[instanceId] || projectInterface?.controller[0]?.name;
-  const currentResourceName = selectedResource[instanceId] || projectInterface?.resource[0]?.name;
 
   // 获取连接状态信息
   const getStatusInfo = useCallback(() => {
@@ -216,106 +205,28 @@ function InstanceCard({ instanceId, instanceName, isActive, onSelect }: Instance
         try {
           log.info(`[${instanceName}] 开始执行任务, 数量:`, enabledTasks.length);
 
-          // 构建任务配置列表
-          const taskConfigs: TaskConfig[] = [];
-          for (const selectedTask of enabledTasks) {
-            // 先检查是否是 MXU 特殊任务
-            const specialTask = getMxuSpecialTask(selectedTask.taskName);
-            const taskDef =
-              specialTask?.taskDef ||
-              projectInterface?.task.find((t) => t.name === selectedTask.taskName);
-            if (!taskDef) continue;
-
-            taskConfigs.push({
-              entry: taskDef.entry,
-              pipeline_override: generateTaskPipelineOverride(
-                selectedTask,
-                projectInterface,
-                currentControllerName,
-                currentResourceName,
-              ),
-              // 传递 selectedTaskId，后端用于建立 maaTaskId -> selectedTaskId 映射
-              selected_task_id: selectedTask.id,
-            });
-            // MXU 特殊任务的 label 是 MXU i18n key，需要用 t() 翻译
-            const taskDisplayName =
-              selectedTask.customName ||
-              (specialTask && taskDef.label
-                ? t(taskDef.label)
-                : resolveI18nText(taskDef.label, translations)) ||
-              selectedTask.taskName;
-            registerEntryTaskName(taskDef.entry, taskDisplayName);
-          }
-
-          if (taskConfigs.length === 0) {
+          if (enabledTasks.length === 0) {
             log.warn(`[${instanceName}] 没有可执行的任务`);
             setIsStarting(false);
             return;
           }
 
-          // 准备 Agent 配置（支持单个或多个 Agent）
-          const agentConfigs = normalizeAgentConfigs(projectInterface?.agent);
-
-          // PI v2.5.0: 构建 Agent 子进程环境变量
-          const piEnvs = agentConfigs?.length
-            ? buildPiEnvVars({
-                projectInterface,
-                controllerName: currentControllerName,
-                resourceName: currentResourceName,
-                translations,
-                language,
-                maaVersion,
-              })
-            : undefined;
-
           updateInstance(instanceId, { isRunning: true });
           setInstanceTaskStatus(instanceId, 'Running');
           setShowAddTaskPanel(false);
 
-          // 任务可能在 startTasks 返回前就瞬时结束，先启动全局回调缓存再提交。
-          await startGlobalCallbackListener();
-
-          // 启动任务
-          const taskIds = await maaService.startTasks(
-            instanceId,
-            taskConfigs,
-            agentConfigs,
-            basePath,
-            tcpCompatMode,
-            piEnvs,
-          );
-
-          log.info(`[${instanceName}] 任务已提交, task_ids:`, taskIds);
-
-          // 注册 task_id 与任务名的映射（用于日志显示），后端管理状态
-          taskIds.forEach((maaTaskId, index) => {
-            if (enabledTasks[index]) {
-              // MXU 特殊任务的 label 需要用 t() 翻译
-              const specialTask = getMxuSpecialTask(enabledTasks[index].taskName);
-              const taskDef =
-                specialTask?.taskDef ||
-                projectInterface?.task.find((t) => t.name === enabledTasks[index].taskName);
-              const taskDisplayName =
-                enabledTasks[index].customName ||
-                (specialTask && taskDef?.label
-                  ? t(taskDef.label)
-                  : resolveI18nText(taskDef?.label, translations)) ||
-                enabledTasks[index].taskName;
-              registerTaskIdName(maaTaskId, taskDisplayName);
-            }
-          });
+          // With KKAFIO, starting tasks means running the CLI — delegate to kkafio_start
+          try {
+            const { invoke } = await import('@tauri-apps/api/core');
+            await invoke('kkafio_start', { cwd: basePath });
+            log.info(`[${instanceName}] KKAFIO CLI started`);
+          } catch (err) {
+            log.error(`[${instanceName}] kkafio_start failed:`, err);
+          }
 
           setIsStarting(false);
         } catch (err) {
           log.error(`[${instanceName}] 任务启动异常:`, err);
-          const failedAgentConfigs = normalizeAgentConfigs(projectInterface?.agent);
-          if (failedAgentConfigs && failedAgentConfigs.length > 0) {
-            try {
-              await maaService.stopAgent(instanceId);
-            } catch {
-              // 忽略
-            }
-          }
           updateInstance(instanceId, { isRunning: false });
           setInstanceTaskStatus(instanceId, 'Failed');
           setInstanceCurrentTaskId(instanceId, null);
@@ -341,20 +252,12 @@ function InstanceCard({ instanceId, instanceName, isActive, onSelect }: Instance
       registerEntryTaskName,
       setShowAddTaskPanel,
       translations,
-      tcpCompatMode,
     ],
   );
 
-  // 获取最新缓存截图（后端截图循环负责更新缓存，前端无需主动触发 postScreencap）
+  // Screenshot capture not available without MaaFramework
   const captureFrame = useCallback(async (): Promise<string | null> => {
-    if (!instanceId) return null;
-
-    try {
-      const imageData = await maaService.getCachedImage(instanceId);
-      return imageData || null;
-    } catch {
-      return null;
-    }
+    return null;
   }, [instanceId]);
 
   const loopRunningRef = useRef(false);
@@ -406,18 +309,9 @@ function InstanceCard({ instanceId, instanceName, isActive, onSelect }: Instance
     };
   }, []);
 
-  // 订阅/退订后端截图循环（确保全局只有一份 post_screencap 在运行）
+  // Screenshot subscription not available without MaaFramework
   useEffect(() => {
-    if (!instanceId || !isStreaming) return;
-
-    const intervalMs = getFrameInterval(screenshotFrameRate);
-    maaService
-      .screenshotSubscribe(instanceId, `dashboard-${instanceId}`, intervalMs)
-      .catch(() => {});
-
-    return () => {
-      maaService.screenshotUnsubscribe(instanceId, `dashboard-${instanceId}`).catch(() => {});
-    };
+    // no-op
   }, [instanceId, isStreaming, screenshotFrameRate]);
 
   // 响应 store 中 isStreaming 状态变化
@@ -515,19 +409,12 @@ function InstanceCard({ instanceId, instanceName, isActive, onSelect }: Instance
     }
   }, [screenshotUrl]);
 
-  // 断开连接
+  // Disconnect (no-op without MaaFramework)
   const disconnect = useCallback(async () => {
-    try {
-      await maaService.destroyInstance(instanceId);
-      setInstanceConnectionStatus(instanceId, 'Disconnected');
-      useAppStore.getState().setInstanceResourceLoaded(instanceId, false);
-      setScreenshotUrl(null);
-      streamingRef.current = false;
-      setInstanceScreenshotStreaming(instanceId, false);
-    } catch {
-      // 静默处理
-    }
-  }, [instanceId, setInstanceConnectionStatus, setInstanceScreenshotStreaming]);
+    setScreenshotUrl(null);
+    streamingRef.current = false;
+    setInstanceScreenshotStreaming(instanceId, false);
+  }, [instanceId, setInstanceScreenshotStreaming]);
 
   // 强制刷新
   const forceRefresh = useCallback(async () => {

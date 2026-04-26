@@ -1,11 +1,9 @@
 pub mod commands;
-mod mxu_actions;
-pub mod screenshot_service;
 mod tray;
 mod web_server;
 pub mod ws_broadcast;
 
-use commands::{AppConfigState, MaaState};
+use commands::{AppConfigState, AppState, KkafioState};
 use std::sync::Arc;
 use tauri::Manager;
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
@@ -13,14 +11,10 @@ use ws_broadcast::WsBroadcast;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 日志目录：exe 目录/debug/logs（与前端日志同目录）
     let logs_dir = commands::utils::get_logs_dir();
-
-    // 确保日志目录存在
     let _ = std::fs::create_dir_all(&logs_dir);
 
-    // 自动迁移旧版注册表自启动到任务计划程序
-    //TODO：26年2月写的，应该过几个月这自动迁移就能去除了，等旧版的都更上来
+    // Auto-migrate legacy registry autostart → task scheduler
     #[cfg(windows)]
     commands::system::migrate_legacy_autostart();
 
@@ -37,7 +31,6 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_log::Builder::new()
-                // 默认约 40KB + KeepOne 会整文件删除，不便排查；改为单文件更大且保留多份轮转档
                 .max_file_size(1 * 1024 * 1024)
                 .rotation_strategy(RotationStrategy::KeepSome(8))
                 .targets({
@@ -46,7 +39,6 @@ pub fn run() {
                         path: logs_dir,
                         file_name: Some("mxu-tauri".into()),
                     })];
-                    // debug 构建额外输出到标准流便于开发调试
                     #[cfg(debug_assertions)]
                     targets.push(Target::new(TargetKind::Stdout));
                     targets
@@ -56,16 +48,13 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
-            // 创建 MaaState 并注册为 Tauri 管理状态
-            let maa_state = Arc::new(MaaState::default());
-
-            // 创建 AppConfigState：加载 interface.json 和配置文件
+            // Create shared state objects
+            let app_state = Arc::new(AppState::default());
             let app_config = Arc::new(AppConfigState::default());
-
-            // 创建 WebSocket 广播器（容量 256，被 emit_callback_event/emit_agent_output 共用）
+            let kkafio_state = Arc::new(KkafioState::default());
             let ws_broadcast = Arc::new(WsBroadcast::new(256));
 
-            // 加载 interface.json（含 import 处理和翻译）
+            // Load interface.json from the exe directory
             match commands::utils::get_exe_directory() {
                 Ok(exe_dir) => {
                     app_config.load_interface(&exe_dir);
@@ -75,7 +64,7 @@ pub fn run() {
                 }
             }
 
-            // 加载配置文件
+            // Load config file
             match commands::utils::get_app_data_dir() {
                 Ok(data_dir) => {
                     app_config.load_config(&data_dir);
@@ -85,21 +74,19 @@ pub fn run() {
                 }
             }
 
-            // 先注册共享状态，再启动依赖这些状态的后台任务，避免启动竞态
+            // Register shared state
             app.manage(ws_broadcast.clone());
+            app.manage(app_state.clone());
             app.manage(app_config.clone());
+            app.manage(kkafio_state);
 
-            // 启动 HTTP Web 服务器（后台 tokio 任务，不阻塞 Tauri 启动）
+            // Start the HTTP web server (background tokio task)
             {
-                let maa_clone = maa_state.clone();
                 let cfg_clone = app_config.clone();
                 let ws_clone = ws_broadcast.clone();
                 let app_handle = app.handle().clone();
 
-                let settings = app_config
-                    .config
-                    .lock()
-                    .unwrap();
+                let settings = app_config.config.lock().unwrap();
                 let settings_obj = settings.get("settings");
 
                 let allow_lan_access = settings_obj
@@ -119,7 +106,6 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     web_server::start_web_server(
                         cfg_clone,
-                        maa_clone,
                         app_handle,
                         ws_clone,
                         web_port,
@@ -129,8 +115,7 @@ pub fn run() {
                 });
             }
 
-            // Windows 下移除系统标题栏（使用自定义标题栏）
-            // macOS/Linux 保留完整的原生标题栏
+            // Remove system title bar on Windows (custom title bar in use)
             #[cfg(target_os = "windows")]
             {
                 if let Some(window) = app.get_webview_window("main") {
@@ -138,7 +123,7 @@ pub fn run() {
                 }
             }
 
-            // 启动时异步清理 cache/old 目录（更新残留的旧文件），不阻塞应用启动
+            // Clean up leftover cache/old directory on startup
             if let Ok(data_dir) = commands::get_data_dir() {
                 let old_dir = std::path::Path::new(&data_dir).join("cache").join("old");
                 if old_dir.exists() {
@@ -159,44 +144,7 @@ pub fn run() {
                 }
             }
 
-            // 启动时自动加载 MaaFramework DLL
-            if let Ok(maafw_dir) = commands::get_maafw_dir() {
-                if maafw_dir.exists() {
-                    #[cfg(windows)]
-                    let dll_path = maafw_dir.join("MaaFramework.dll");
-                    #[cfg(target_os = "macos")]
-                    let dll_path = maafw_dir.join("libMaaFramework.dylib");
-                    #[cfg(target_os = "linux")]
-                    let dll_path = maafw_dir.join("libMaaFramework.so");
-
-                    match maa_framework::load_library(&dll_path) {
-                        Ok(()) => {
-                            log::info!("MaaFramework loaded from {:?}", dll_path);
-                            // 预先设置 lib_dir，使 HTTP /api/maa/initialized 立即反映加载状态
-                            *maa_state.lib_dir.lock().unwrap() = Some(maafw_dir.clone());
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load MaaFramework: {}", e);
-                            // 检查是否是 DLL 存在但加载失败的情况（可能是运行库缺失）
-                            if dll_path.exists() {
-                                log::warn!(
-                                    "DLLs exist but failed to load, possibly missing VC++ runtime: {}",
-                                    e
-                                );
-                                // 设置标记，前端加载完成后会查询此标记
-                                commands::system::set_vcredist_missing(true);
-                            }
-                        }
-                    }
-                } else {
-                    log::warn!("MaaFramework directory not found: {:?}", maafw_dir);
-                }
-            }
-
-            // DLL 加载完成后再注册 maa_state（确保 lib_dir 已设置）
-            app.manage(maa_state);
-
-            // 初始化系统托盘
+            // Initialize system tray
             if let Err(e) = tray::init_tray(app.handle()) {
                 log::error!("Failed to initialize system tray: {}", e);
             }
@@ -204,36 +152,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            // Maa 核心命令
-            commands::maa_core::maa_init,
-            commands::maa_core::maa_set_resource_dir,
-            commands::maa_core::maa_get_version,
-            commands::maa_core::maa_check_version,
-            commands::maa_core::maa_find_adb_devices,
-            commands::maa_core::maa_find_win32_windows,
-            commands::maa_core::maa_find_wlroots_sockets,
-            commands::maa_core::maa_create_instance,
-            commands::maa_core::maa_destroy_instance,
-            commands::maa_core::maa_connect_controller,
-            commands::maa_core::maa_get_connection_status,
-            commands::maa_core::maa_load_resource,
-            commands::maa_core::maa_is_resource_loaded,
-            commands::maa_core::maa_get_resource_hash,
-            commands::maa_core::maa_destroy_resource,
-            commands::maa_core::maa_run_task,
-            commands::maa_core::maa_get_task_status,
-            commands::maa_core::maa_stop_task,
-            commands::maa_core::maa_override_pipeline,
-            commands::maa_core::maa_is_running,
-            commands::maa_core::maa_post_click,
-            commands::maa_core::maa_post_screencap,
-            commands::maa_core::maa_get_cached_image,
-            commands::maa_core::maa_screenshot_subscribe,
-            commands::maa_core::maa_screenshot_unsubscribe,
-            // Agent 命令
-            commands::maa_agent::maa_start_tasks,
-            commands::maa_agent::maa_stop_agent,
-            // 文件操作命令
+            // KKAFIO process commands
+            commands::kkafio::kkafio_start,
+            commands::kkafio::kkafio_stop,
+            commands::kkafio::kkafio_is_running,
+            commands::kkafio::kkafio_group_chara_export,
+            commands::kkafio::kkafio_trash,
+            commands::kkafio::kkafio_run_game,
+            // File operation commands
             commands::file_ops::read_local_file,
             commands::file_ops::read_local_file_base64,
             commands::file_ops::local_file_exists,
@@ -244,17 +170,12 @@ pub fn run() {
             commands::file_ops::check_exe_path,
             commands::file_ops::set_executable,
             commands::file_ops::export_logs,
-            // 状态查询命令
-            commands::state::maa_get_instance_state,
-            commands::state::maa_get_all_states,
-            commands::state::maa_get_cached_adb_devices,
-            commands::state::maa_get_cached_win32_windows,
-            commands::state::maa_get_cached_wlroots_sockets,
+            // Log / state commands
             commands::state::log_to_stdout,
             commands::state::push_log,
             commands::state::get_all_logs,
             commands::state::clear_instance_logs,
-            // 更新安装命令
+            // Update / install commands
             commands::update::extract_zip,
             commands::update::check_changes_json,
             commands::update::apply_incremental_update,
@@ -263,24 +184,20 @@ pub fn run() {
             commands::update::fallback_update,
             commands::update::move_file_to_old,
             commands::update::cleanup_update_artifacts,
-            // 下载命令
+            // Download commands
             commands::download::get_github_release_by_version,
             commands::download::download_file,
             commands::download::cancel_download,
-            // 系统相关命令
+            // System commands
             commands::system::is_elevated,
             commands::system::is_autostart,
             commands::system::get_start_instance,
             commands::system::has_quit_after_run_flag,
             commands::system::restart_as_admin,
-            commands::system::maa_set_save_draw,
             commands::system::open_file,
             commands::system::run_and_wait,
-            commands::system::set_pre_action_stop,
-            commands::system::run_action,
             commands::system::is_process_running,
             commands::system::get_process_path_from_hwnd,
-            commands::system::retry_load_maa_library,
             commands::system::check_vcredist_missing,
             commands::system::autostart_enable,
             commands::system::autostart_disable,
@@ -291,29 +208,19 @@ pub fn run() {
             commands::system::get_web_server_port,
             commands::system::get_local_lan_ip,
             commands::system::get_webview2_dir,
-            // 托盘相关命令
+            // Tray commands
             commands::tray::set_minimize_to_tray,
             commands::tray::get_minimize_to_tray,
             commands::tray::update_tray_icon,
             commands::tray::update_tray_tooltip,
-            // 配置同步命令（WebUI 实时同步）
+            // Config sync commands
             commands::app_config::notify_config_changed,
         ])
         .on_window_event(|window, event| {
-            match event {
-                // 窗口关闭请求：检查是否最小化到托盘
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if tray::handle_close_requested(window.app_handle()) {
-                        api.prevent_close();
-                    }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if tray::handle_close_requested(window.app_handle()) {
+                    api.prevent_close();
                 }
-                // 窗口销毁时清理所有 agent 子进程
-                tauri::WindowEvent::Destroyed => {
-                    if let Some(state) = window.try_state::<Arc<MaaState>>() {
-                        state.cleanup_all_agent_children();
-                    }
-                }
-                _ => {}
             }
         })
         .run(tauri::generate_context!())

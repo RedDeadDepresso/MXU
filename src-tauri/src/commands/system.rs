@@ -2,16 +2,11 @@
 //!
 //! 提供权限检查、系统信息查询、全局选项设置等功能
 
-use super::types::MaaState;
-use super::types::SystemInfo;
-use super::types::WebView2DirInfo;
-use super::utils::get_maafw_dir;
-use log::{info, warn};
+use super::types::{SystemInfo, WebView2DirInfo};
+use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tauri::State;
 use tokio::time::sleep;
+use std::time::Duration;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -46,7 +41,6 @@ pub fn is_elevated() -> bool {
 
     #[cfg(not(windows))]
     {
-        // 非 Windows 平台：检查是否为 root
         unsafe { libc::geteuid() == 0 }
     }
 }
@@ -60,7 +54,6 @@ pub fn restart_as_admin(app_handle: tauri::AppHandle) -> Result<(), String> {
         use winsafe::{ShellExecuteEx, SHELLEXECUTEINFO};
 
         let exe_path = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {}", e))?;
-
         let exe_path_str = exe_path.to_string_lossy().to_string();
 
         info!("restart_as_admin: restarting with admin privileges");
@@ -73,12 +66,10 @@ pub fn restart_as_admin(app_handle: tauri::AppHandle) -> Result<(), String> {
             ..Default::default()
         });
 
-        // ShellExecuteEx 返回 Result：Ok 表示成功，Err 表示失败
         if let Err(e) = result {
             Err(format!("以管理员身份启动失败: 错误码 {}", e.raw()))
         } else {
             info!("restart_as_admin: new process started, exiting current");
-            // 退出当前进程
             app_handle.exit(0);
             Ok(())
         }
@@ -89,17 +80,6 @@ pub fn restart_as_admin(app_handle: tauri::AppHandle) -> Result<(), String> {
         let _ = app_handle;
         Err("此功能仅在 Windows 上可用".to_string())
     }
-}
-
-/// 设置全局选项 - 保存调试图像
-#[tauri::command]
-pub fn maa_set_save_draw(enabled: bool) -> Result<bool, String> {
-    maa_framework::set_save_draw(enabled)
-        .map(|_| {
-            info!("保存调试图像: {}", if enabled { "启用" } else { "禁用" });
-            true
-        })
-        .map_err(|e| format!("设置保存调试图像失败: {}", e))
 }
 
 /// 打开文件（使用系统默认程序）
@@ -165,48 +145,30 @@ pub async fn run_and_wait(file_path: String) -> Result<i32, String> {
     }
 }
 
-/// 检查指定程序是否正在运行（通过完整路径比较，避免同名程序误判）
-/// 公共工具函数，可被其他模块调用
+/// 检查指定程序是否正在运行（通过完整路径比较）
 pub fn check_process_running(program: &str) -> bool {
     use std::path::PathBuf;
 
     let resolved_path = PathBuf::from(program);
-
-    // 尝试规范化路径用于精确比较
     let canonical_target = resolved_path
         .canonicalize()
         .unwrap_or_else(|_| resolved_path.clone());
-
-    // 提取文件名用于 Windows 下的初步筛选
-    #[cfg(windows)]
-    let file_name = match resolved_path.file_name() {
-        Some(name) => name.to_string_lossy().to_string(),
-        None => {
-            log::warn!(
-                "check_process_running: cannot extract filename from '{}'",
-                program
-            );
-            return false;
-        }
-    };
 
     #[cfg(windows)]
     {
         use winsafe::co::{PROCESS, PROCESS_NAME, TH32CS};
         use winsafe::{HPROCESS, HPROCESSLIST};
 
+        let file_name = match resolved_path.file_name() {
+            Some(name) => name.to_string_lossy().to_string(),
+            None => return false,
+        };
         let file_name_lower = file_name.to_lowercase();
         let target_lower = canonical_target.to_string_lossy().to_lowercase();
 
         let mut snapshot = match HPROCESSLIST::CreateToolhelp32Snapshot(TH32CS::SNAPPROCESS, None) {
             Ok(h) => h,
-            Err(e) => {
-                log::error!(
-                    "check_process_running: CreateToolhelp32Snapshot failed: {}",
-                    e
-                );
-                return false;
-            }
+            Err(_) => return false,
         };
         for process_result in snapshot.iter_processes() {
             if let Ok(entry) = process_result {
@@ -223,12 +185,7 @@ pub fn check_process_running(program: &str) -> bool {
                                 .canonicalize()
                                 .map(|p| p.to_string_lossy().to_lowercase())
                                 .unwrap_or_else(|_| running_path.to_lowercase());
-
                             if running_canonical == target_lower {
-                                info!(
-                                    "check_process_running: '{}' -> true (matched: {})",
-                                    program, running_path
-                                );
                                 return true;
                             }
                         }
@@ -238,14 +195,11 @@ pub fn check_process_running(program: &str) -> bool {
                 break;
             }
         }
-
-        info!("check_process_running: '{}' -> false", program);
         false
     }
 
     #[cfg(target_os = "linux")]
     {
-        // 遍历 /proc/<pid>/exe 读取真实可执行路径进行比较
         if let Ok(proc_dir) = std::fs::read_dir("/proc") {
             for entry in proc_dir.flatten() {
                 let name = entry.file_name();
@@ -253,36 +207,25 @@ pub fn check_process_running(program: &str) -> bool {
                 if !name_str.chars().all(|c| c.is_ascii_digit()) {
                     continue;
                 }
-
                 let exe_link = entry.path().join("exe");
                 if let Ok(resolved) = std::fs::read_link(&exe_link) {
                     let canonical = resolved.canonicalize().unwrap_or(resolved);
                     if canonical == canonical_target {
-                        info!(
-                            "check_process_running: '{}' -> true (pid: {})",
-                            program, name_str
-                        );
                         return true;
                     }
                 }
             }
         }
-
-        info!("check_process_running: '{}' -> false", program);
         false
     }
 
     #[cfg(target_os = "macos")]
     {
-        // macOS 没有 /proc，通过 libproc API 获取每个进程的可执行路径进行比较
         extern "C" {
             fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
             fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
         }
-
         unsafe {
-            // proc_listallpids 返回填入的 PID 数量。
-            // 从合理初始容量开始，若缓冲区不足则扩容重试，避免多余的探测调用。
             let mut capacity = 1024usize;
             let num_pids;
             let mut pids;
@@ -290,56 +233,27 @@ pub fn check_process_running(program: &str) -> bool {
                 pids = vec![0i32; capacity];
                 let buf_size = (capacity * std::mem::size_of::<i32>()) as i32;
                 let actual = proc_listallpids(pids.as_mut_ptr(), buf_size);
-                if actual <= 0 {
-                    info!(
-                        "check_process_running: '{}' -> false (list failed)",
-                        program
-                    );
-                    return false;
-                }
-                if actual as usize >= capacity {
-                    // 缓冲区已满，可能被截断，扩容后重试
-                    capacity *= 2;
-                    continue;
-                }
+                if actual <= 0 { return false; }
+                if actual as usize >= capacity { capacity *= 2; continue; }
                 num_pids = actual as usize;
                 break;
             }
-
-            // PROC_PIDPATHINFO_MAXSIZE = 4096
             let mut path_buf = [0u8; 4096];
-
             for &pid in &pids[..num_pids] {
-                if pid == 0 {
-                    continue;
-                }
-
+                if pid == 0 { continue; }
                 let ret = proc_pidpath(pid, path_buf.as_mut_ptr(), path_buf.len() as u32);
-                if ret <= 0 {
-                    continue;
-                }
-
+                if ret <= 0 { continue; }
                 if let Ok(path_str) = std::str::from_utf8(&path_buf[..ret as usize]) {
                     let pid_path = PathBuf::from(path_str);
                     let canonical = pid_path.canonicalize().unwrap_or(pid_path);
-                    if canonical == canonical_target {
-                        info!(
-                            "check_process_running: '{}' -> true (pid: {})",
-                            program, pid
-                        );
-                        return true;
-                    }
+                    if canonical == canonical_target { return true; }
                 }
             }
         }
-
-        info!("check_process_running: '{}' -> false", program);
         false
     }
 }
 
-/// Tauri 命令：检查指定程序是否正在运行
-/// program: 程序的绝对路径
 #[tauri::command]
 pub fn is_process_running(program: String) -> bool {
     check_process_running(&program)
@@ -356,25 +270,16 @@ pub fn get_process_path_from_hwnd(hwnd: u64) -> Result<String, String> {
         if hwnd == 0 {
             return Err("Invalid window handle (null)".to_string());
         }
-
         let hwnd = unsafe { HWND::from_ptr(hwnd as *mut _) };
         let (_, pid) = hwnd.GetWindowThreadProcessId();
-
         if pid == 0 {
             return Err("PID is 0".to_string());
         }
-
         let process = HPROCESS::OpenProcess(PROCESS::QUERY_LIMITED_INFORMATION, false, pid)
             .map_err(|e| format!("OpenProcess failed: {}", e))?;
-
         let path = process
             .QueryFullProcessImageName(PROCESS_NAME::WIN32)
             .map_err(|e| format!("QueryFullProcessImageName failed: {}", e))?;
-
-        info!(
-            "get_process_path_from_hwnd: hwnd={} pid={} path={}",
-            hwnd, pid, path
-        );
         Ok(path)
     }
 
@@ -383,137 +288,6 @@ pub fn get_process_path_from_hwnd(hwnd: u64) -> Result<String, String> {
         let _ = hwnd;
         Err("This command is only available on Windows".to_string())
     }
-}
-
-/// Run pre-action (launch program and optionally wait for exit)
-/// program: 程序路径
-/// args: 附加参数（空格分隔）
-/// cwd: 工作目录（可选，默认为程序所在目录）
-/// wait_for_exit: 是否等待进程退出
-#[tauri::command]
-pub fn set_pre_action_stop(
-    state: State<Arc<MaaState>>,
-    instance_id: String,
-    stop: bool,
-) -> Result<(), String> {
-    let mut requests = state
-        .pre_action_stop_requests
-        .lock()
-        .map_err(|e| e.to_string())?;
-    if stop {
-        requests.insert(instance_id);
-    } else {
-        requests.remove(&instance_id);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn run_action(
-    state: State<'_, Arc<MaaState>>,
-    instance_id: String,
-    program: String,
-    args: String,
-    cwd: Option<String>,
-    wait_for_exit: bool,
-    use_cmd: Option<bool>,
-) -> Result<i32, String> {
-    let use_cmd = use_cmd.unwrap_or(false);
-
-    info!(
-        "run_action: instance_id={}, program={}, args={}, wait={}, use_cmd={}",
-        instance_id, program, args, wait_for_exit, use_cmd
-    );
-
-    // 使用 shell 语义解析参数至数组（支持引号）
-    let args_vec: Vec<String> = if args.trim().is_empty() {
-        vec![]
-    } else {
-        shell_words::split(&args).map_err(|e| format!("Failed to parse args: {}", e))?
-    };
-
-    let mut cmd = super::utils::build_launch_command(&program, &args_vec, use_cmd);
-
-    // 设置工作目录
-    if let Some(ref dir) = cwd {
-        cmd.current_dir(dir);
-    } else {
-        // 默认使用程序所在目录作为工作目录
-        if let Some(parent) = std::path::Path::new(&program).parent() {
-            if parent.exists() {
-                cmd.current_dir(parent);
-            }
-        }
-    }
-
-    if wait_for_exit {
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to run action: {} - {}", program, e))?;
-
-        loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|e| format!("Failed to wait action: {} - {}", program, e))?
-            {
-                let exit_code = status.code().unwrap_or(-1);
-                info!("run_action finished with exit code: {}", exit_code);
-                return Ok(exit_code);
-            }
-
-            let stop_requested = {
-                let requests = state
-                    .pre_action_stop_requests
-                    .lock()
-                    .map_err(|e| e.to_string())?;
-                requests.contains(&instance_id)
-            };
-
-            if stop_requested {
-                info!("run_action wait cancelled by stop request: {}", instance_id);
-                // 停止只中断等待，不强制终止前置程序；交给后台线程 wait 以避免子进程泄漏。
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Err("MXU_PRE_ACTION_CANCELLED".to_string());
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
-    } else {
-        // 不等待，启动后立即返回
-        cmd.spawn()
-            .map_err(|e| format!("Failed to spawn action: {} - {}", program, e))?;
-
-        info!("run_action spawned (not waiting)");
-        Ok(0) // 不等待时返回 0
-    }
-}
-
-/// 重新尝试加载 MaaFramework 库
-#[tauri::command]
-pub async fn retry_load_maa_library() -> Result<String, String> {
-    info!("retry_load_maa_library");
-
-    let maafw_dir = get_maafw_dir()?;
-    if !maafw_dir.exists() {
-        return Err("MaaFramework directory not found".to_string());
-    }
-
-    // Load library
-    #[cfg(windows)]
-    let dll_path = maafw_dir.join("MaaFramework.dll");
-    #[cfg(target_os = "macos")]
-    let dll_path = maafw_dir.join("libMaaFramework.dylib");
-    #[cfg(target_os = "linux")]
-    let dll_path = maafw_dir.join("libMaaFramework.so");
-
-    maa_framework::load_library(&dll_path).map_err(|e| e.to_string())?;
-
-    let version = maa_framework::maa_version().to_string();
-    info!("MaaFramework loaded successfully, version: {}", version);
-
-    Ok(version)
 }
 
 /// 检查是否检测到 VC++ 运行库缺失（检查后自动清除标记）
@@ -526,7 +300,7 @@ pub fn check_vcredist_missing() -> bool {
     missing
 }
 
-/// 检查本次启动是否来自开机自启动（通过 --autostart 参数判断）
+/// 检查本次启动是否来自开机自启动
 #[tauri::command]
 pub fn is_autostart() -> bool {
     std::env::args().any(|arg| arg == "--autostart")
@@ -562,13 +336,12 @@ MXU 命令行参数
       显示本帮助并退出
 
   --autostart
-      以开机自启动模式运行，并触发自动执行逻辑
+      以开机自启动模式运行
       通常由 MXU 创建的系统自启动任务自动传入
 
   -i, --instance <实例名>
       指定自动执行时使用的实例名
       仅在 --autostart 模式下生效
-      也支持 -i=<实例名> 与 --instance=<实例名> 写法
 
   -q, --quit-after-run
       当本次启动实际触发自动执行后，在任务完成时自动退出
@@ -580,9 +353,6 @@ MXU 命令行参数
     )
 }
 
-/// 从命令行参数中获取指定选项的值
-/// 支持 `-x value`、`--name value`、`-x=value`、`--name=value` 格式
-/// 返回第一个匹配的值；若值缺失或以 `-` 开头则视为无效并跳过
 fn get_cli_arg_value(short: &str, long: &str) -> Option<String> {
     let short_eq = format!("{}=", short);
     let long_eq = format!("{}=", long);
@@ -607,19 +377,16 @@ fn get_cli_arg_value(short: &str, long: &str) -> Option<String> {
     None
 }
 
-/// 获取命令行 -i/--instance 参数指定的启动实例名称
 #[tauri::command]
 pub fn get_start_instance() -> Option<String> {
     get_cli_arg_value("-i", "--instance")
 }
 
-/// 检查命令行是否包含 -q/--quit-after-run 参数（任务完成后关闭自身）
 #[tauri::command]
 pub fn has_quit_after_run_flag() -> bool {
     std::env::args().any(|arg| arg == "-q" || arg == "--quit-after-run")
 }
 
-/// 自动迁移旧版注册表自启动到任务计划程序
 #[cfg(windows)]
 pub fn migrate_legacy_autostart() {
     if has_legacy_registry_autostart() {
@@ -627,11 +394,8 @@ pub fn migrate_legacy_autostart() {
             remove_legacy_registry_autostart();
         }
     }
-    // 兼容迁移：老版本已创建的计划任务可能缺少交互式运行或启动延迟，自动重建为新配置
     if schtask_autostart_needs_refresh() {
-        if let Err(err) = create_schtask_autostart() {
-            warn!("重建自启动计划任务失败: {}", err);
-        }
+        let _ = create_schtask_autostart();
     }
 }
 
@@ -642,21 +406,11 @@ fn create_schtask_autostart() -> Result<(), String> {
     let exe = exe_path.to_string_lossy();
     let output = std::process::Command::new("schtasks")
         .args([
-            "/create",
-            "/tn",
-            "MXU",
-            "/tr",
-            &format!("\"{}\" --autostart", exe),
-            "/sc",
-            "onlogon",
-            // 登录后延迟 30 秒再启动，降低桌面会话尚未完全就绪时的白屏/卡死概率
-            "/delay",
-            "0000:30",
-            // 强制交互式运行，确保进程绑定到用户桌面会话，避免登录早期会话未就绪导致 WebView 白屏
-            "/it",
-            "/rl",
-            "highest",
-            "/f",
+            "/create", "/tn", "MXU",
+            "/tr", &format!("\"{}\" --autostart", exe),
+            "/sc", "onlogon",
+            "/delay", "0000:30",
+            "/it", "/rl", "highest", "/f",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -668,11 +422,9 @@ fn create_schtask_autostart() -> Result<(), String> {
     Ok(())
 }
 
-/// 判断现有 MXU 自启动计划任务是否需要刷新参数
 #[cfg(windows)]
 fn schtask_autostart_needs_refresh() -> bool {
     use regex::Regex;
-
     use std::os::windows::process::CommandExt;
     let output = match std::process::Command::new("schtasks")
         .args(["/query", "/tn", "MXU", "/xml"])
@@ -680,45 +432,29 @@ fn schtask_autostart_needs_refresh() -> bool {
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return false, // 不存在任务或查询失败，不做迁移
+        _ => return false,
     };
-
     let xml = String::from_utf8_lossy(&output.stdout);
     let tag_equals = |tag: &str, expected: &str| -> bool {
         let pattern = format!(
             r"(?is)<\s*{}\s*>\s*{}\s*<\s*/\s*{}\s*>",
-            regex::escape(tag),
-            regex::escape(expected),
-            regex::escape(tag)
+            regex::escape(tag), regex::escape(expected), regex::escape(tag)
         );
-        Regex::new(&pattern)
-            .map(|re| re.is_match(&xml))
-            .unwrap_or(false)
+        Regex::new(&pattern).map(|re| re.is_match(&xml)).unwrap_or(false)
     };
-
-    // 尊重用户手动禁用：禁用状态下不自动重建
-    let enabled = tag_equals("Enabled", "true");
-    if !enabled {
-        return false;
-    }
-
-    let has_interactive = tag_equals("LogonType", "InteractiveToken");
-    let has_delay_30s = tag_equals("Delay", "PT30S");
-    !(has_interactive && has_delay_30s)
+    if !tag_equals("Enabled", "true") { return false; }
+    !(tag_equals("LogonType", "InteractiveToken") && tag_equals("Delay", "PT30S"))
 }
 
-/// 清理旧版注册表自启动条目（tauri-plugin-autostart 遗留）
 #[cfg(windows)]
 fn remove_legacy_registry_autostart() {
     use winsafe::co::{KEY, REG_OPTION};
     use winsafe::HKEY;
-
     let key_result = HKEY::CURRENT_USER.RegOpenKeyEx(
         Some(r"Software\Microsoft\Windows\CurrentVersion\Run"),
         REG_OPTION::NoValue,
         KEY::SET_VALUE | KEY::QUERY_VALUE,
     );
-
     if let Ok(key) = key_result {
         for name in &["mxu", "MXU"] {
             let _ = key.RegDeleteValue(Some(name));
@@ -726,27 +462,22 @@ fn remove_legacy_registry_autostart() {
     }
 }
 
-/// 检查旧版注册表中是否存在自启动条目
 #[cfg(windows)]
 fn has_legacy_registry_autostart() -> bool {
     use winsafe::co::{KEY, REG_OPTION};
     use winsafe::HKEY;
-
     let key_result = HKEY::CURRENT_USER.RegOpenKeyEx(
         Some(r"Software\Microsoft\Windows\CurrentVersion\Run"),
         REG_OPTION::NoValue,
         KEY::QUERY_VALUE,
     );
     if let Ok(key) = key_result {
-        ["mxu", "MXU"]
-            .iter()
-            .any(|name| key.RegQueryValueEx(Some(name)).is_ok())
+        ["mxu", "MXU"].iter().any(|name| key.RegQueryValueEx(Some(name)).is_ok())
     } else {
         false
     }
 }
 
-/// 通过 Windows 任务计划程序启用开机自启动（以最高权限运行，避免 UAC 弹窗）
 #[tauri::command]
 pub fn autostart_enable() -> Result<(), String> {
     #[cfg(windows)]
@@ -756,12 +487,9 @@ pub fn autostart_enable() -> Result<(), String> {
         Ok(())
     }
     #[cfg(not(windows))]
-    {
-        Err("此功能仅在 Windows 上可用".to_string())
-    }
+    Err("此功能仅在 Windows 上可用".to_string())
 }
 
-/// 通过 Windows 任务计划程序禁用开机自启动
 #[tauri::command]
 pub fn autostart_disable() -> Result<(), String> {
     #[cfg(windows)]
@@ -771,17 +499,13 @@ pub fn autostart_disable() -> Result<(), String> {
             .args(["/delete", "/tn", "MXU", "/f"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
-        // 清理旧版注册表条目
         remove_legacy_registry_autostart();
         Ok(())
     }
     #[cfg(not(windows))]
-    {
-        Err("此功能仅在 Windows 上可用".to_string())
-    }
+    Err("此功能仅在 Windows 上可用".to_string())
 }
 
-/// 查询是否存在自启动（任务计划程序或旧版注册表）
 #[tauri::command]
 pub fn autostart_is_enabled() -> bool {
     #[cfg(windows)]
@@ -796,67 +520,43 @@ pub fn autostart_is_enabled() -> bool {
         schtask || has_legacy_registry_autostart()
     }
     #[cfg(not(windows))]
-    {
-        false
-    }
+    false
 }
 
-/// 获取系统架构
 #[tauri::command]
 pub fn get_arch() -> String {
     std::env::consts::ARCH.to_string()
 }
 
-/// 获取操作系统类型
 #[tauri::command]
 pub fn get_os() -> String {
     std::env::consts::OS.to_string()
 }
 
-/// 获取系统信息
 #[tauri::command]
 pub fn get_system_info() -> SystemInfo {
-    // 获取操作系统名称
     let os = std::env::consts::OS.to_string();
-
-    // 获取操作系统版本
     let info = os_info::get();
     let os_version = format!("{} {}", info.os_type(), info.version());
-
-    // 获取系统架构
     let arch = std::env::consts::ARCH.to_string();
-
-    // 获取 Tauri 框架版本（来自 Tauri 常量）
     let tauri_version = tauri::VERSION.to_string();
-
-    SystemInfo {
-        os,
-        os_version,
-        arch,
-        tauri_version,
-    }
+    SystemInfo { os, os_version, arch, tauri_version }
 }
 
 /// 获取 Web 服务器实际监听端口
-///
-/// 若服务器尚未完成绑定，最多等待 5 秒后返回（0 表示超时未启动）。
 #[tauri::command]
 pub async fn get_web_server_port() -> u16 {
     let port = crate::web_server::get_actual_port();
-    if port != 0 {
-        return port;
-    }
+    if port != 0 { return port; }
     for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         let port = crate::web_server::get_actual_port();
-        if port != 0 {
-            return port;
-        }
+        if port != 0 { return port; }
     }
     0
 }
 
-/// 获取本机局域网 IP（用于 Web UI 显示可访问的地址）
+/// 获取本机局域网 IP
 #[tauri::command]
 pub fn get_local_lan_ip() -> Option<String> {
     crate::web_server::get_local_ip().map(|s| s.to_string())
@@ -866,15 +566,8 @@ pub fn get_local_lan_ip() -> Option<String> {
 #[tauri::command]
 pub fn get_webview2_dir() -> WebView2DirInfo {
     if let Ok(folder) = std::env::var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") {
-        WebView2DirInfo {
-            path: folder,
-            system: false,
-        }
+        WebView2DirInfo { path: folder, system: false }
     } else {
-        // 没有设置自定义目录，使用系统 WebView2
-        WebView2DirInfo {
-            path: String::new(),
-            system: true,
-        }
+        WebView2DirInfo { path: String::new(), system: true }
     }
 }

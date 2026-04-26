@@ -4,7 +4,7 @@ import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { GripVertical, ChevronRight, X, Loader2, FileText, Link, AlertCircle } from 'lucide-react';
 import { useAppStore, type TaskRunStatus } from '@/stores/appStore';
-import { maaService } from '@/services/maaService';
+
 import { useResolvedContent } from '@/services/contentResolver';
 import { generateTaskPipelineOverride } from '@/utils';
 import { OptionEditor, SwitchGrid, switchHasNestedOptions } from './OptionEditor';
@@ -16,7 +16,6 @@ import type { SelectedTask } from '@/types/interface';
 import { isMxuSpecialTask, getMxuSpecialTask, findMxuOptionByKey } from '@/types/specialTasks';
 import { getInterfaceLangKey } from '@/i18n';
 import clsx from 'clsx';
-import { loggers } from '@/utils/logger';
 
 /** 选项预览标签组件 */
 function OptionPreviewTag({
@@ -444,10 +443,10 @@ export function TaskItem({ instanceId, task }: TaskItemProps) {
       projectInterface,
       currentControllerName,
       currentResourceName,
+      instance?.globalOptionValues,
     );
-    maaService.overridePipeline(instanceId, maaTaskId, pipelineOverride).catch((err) => {
-      loggers.task.error('Failed to override pipeline:', err);
-    });
+    // Pipeline override not applicable without MaaFramework
+    void pipelineOverride;
   }, [
     task.optionValues,
     taskRunStatus,
@@ -584,16 +583,24 @@ export function TaskItem({ instanceId, task }: TaskItemProps) {
         previews.push({
           key: optionKey,
           label: optionLabel,
-          value: `${caseNames.length}/${optionDef.cases.length}`,
+          value: `${caseNames.length}/${'cases' in optionDef ? optionDef.cases.length : 0}`,
           type: 'checkbox',
         });
+      } else if (optionDef.type === 'folder' || optionDef.type === 'file_list' || optionDef.type === 'textarea' || optionDef.type === 'action_button') {
+        // These types have no case-based preview — skip or show a simple value
+        if (optionDef.type === 'folder' && optionValue?.type === 'folder' && optionValue.path) {
+          previews.push({ key: optionKey, label: optionLabel, value: optionValue.path.split(/[\\/]/).pop() ?? optionValue.path, type: 'select' });
+        } else if (optionDef.type === 'file_list' && optionValue?.type === 'file_list') {
+          previews.push({ key: optionKey, label: optionLabel, value: `${optionValue.paths.length}`, type: 'select' });
+        }
       } else {
         // select 类型（默认）
+        const selectDef = optionDef as import('@/types/interface').SelectOption;
         const caseName =
           optionValue?.type === 'select'
             ? optionValue.caseName
-            : optionDef.default_case || optionDef.cases?.[0]?.name || '';
-        const selectedCase = optionDef.cases?.find((c) => c.name === caseName);
+            : ('default_case' in selectDef ? selectDef.default_case : undefined) || selectDef.cases?.[0]?.name || '';
+        const selectedCase = selectDef.cases?.find((c: import('@/types/interface').CaseItem) => c.name === caseName);
         // MXU 特殊任务的 case label 也需要用 t() 翻译
         const caseLabel = selectedCase
           ? isMxuOption

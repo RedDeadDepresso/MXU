@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '@/stores/appStore';
 import { TaskItem } from './TaskItem';
+import { GlobalOptionPanel } from './GlobalOptionPanel';
 import { ActionItem } from './ActionItem';
 import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu';
 import type { PresetItem } from '@/types/interface';
@@ -393,6 +394,9 @@ export function TaskList() {
           className="flex-1 flex flex-col overflow-y-auto p-3 gap-2"
           onContextMenu={handleListContextMenu}
         >
+          {/* 全局选项，常驻顶部 */}
+          <GlobalOptionPanel instanceId={instance.id} />
+
           {showPreActions && (
             <DndContext
               sensors={sensors}
@@ -448,6 +452,9 @@ export function TaskList() {
         onContextMenu={handleListContextMenu}
       >
         <div className="space-y-2">
+          {/* 全局选项（如 GamePath），常驻顶部，不可拖动 */}
+          <GlobalOptionPanel instanceId={instance.id} />
+
           {/* 前置动作列表（支持拖拽排序） */}
           {showPreActions && (
             <DndContext

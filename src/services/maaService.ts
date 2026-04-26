@@ -667,7 +667,7 @@ export const maaService = {
   ): Promise<UnlistenFn> {
     if (!isTauri()) {
       // 浏览器环境：通过 WebSocket 接收 maa-callback 事件
-      return wsService.onMaaCallback((message, details) => {
+      return wsService.onMaaCallback((message: string, details: string) => {
         try {
           const parsedDetails = JSON.parse(details) as MaaCallbackDetails;
           callback(message, parsedDetails);

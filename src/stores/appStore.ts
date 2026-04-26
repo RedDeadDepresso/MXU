@@ -1,6 +1,5 @@
 import i18n, { getInterfaceLangKey, setLanguage as setI18nLanguage } from '@/i18n';
 import { saveConfig } from '@/services/configService';
-import { maaService } from '@/services/maaService';
 import {
   type AccentColor,
   applyTheme,
@@ -251,12 +250,7 @@ export const useAppStore = create<AppState>()(
     saveDraw: false,
     setSaveDraw: async (enabled) => {
       set({ saveDraw: enabled });
-      // 调用 MaaFramework API 设置全局选项
-      try {
-        await maaService.setSaveDraw(enabled);
-      } catch (err) {
-        loggers.app.error('设置保存调试图像失败:', err);
-      }
+      // No-op: MaaFramework removed
     },
 
     // Interface 数据
@@ -328,6 +322,7 @@ export const useAppStore = create<AppState>()(
         resourceName: defaultResourceNameValue,
         selectedTasks: defaultTasks,
         isRunning: false,
+        globalOptionValues: {},
       };
 
       // 收集所有新建任务的 ID 用于入场动画
@@ -572,8 +567,10 @@ export const useAppStore = create<AppState>()(
           optionValues[optionKey] = { type: 'checkbox', caseNames: [...defaultCases] };
         } else {
           // select 类型
+          const selectDef = optionDef as import('@/types/interface').SelectOption;
           const caseName =
-            (optionDef.default_case as string | undefined) || optionDef.cases?.[0]?.name || '';
+            (('default_case' in selectDef ? selectDef.default_case : undefined) as string | undefined) ||
+            selectDef.cases?.[0]?.name || '';
           optionValues[optionKey] = { type: 'select', caseName };
         }
       }
@@ -704,6 +701,21 @@ export const useAppStore = create<AppState>()(
 
               return { ...t, optionValues: newOptionValues };
             }),
+          };
+        }),
+      }));
+    },
+
+    setGlobalOptionValue: (instanceId, optionKey, value) => {
+      set((state) => ({
+        instances: state.instances.map((i) => {
+          if (i.id !== instanceId) return i;
+          return {
+            ...i,
+            globalOptionValues: {
+              ...(i.globalOptionValues ?? {}),
+              [optionKey]: value,
+            },
           };
         }),
       }));
@@ -1087,6 +1099,7 @@ export const useAppStore = create<AppState>()(
           savedDevice: inst.savedDevice,
           selectedTasks: savedTasks,
           isRunning: prevRunningByInstance.get(inst.id) ?? false,
+          globalOptionValues: inst.globalOptionValues ?? {},
           schedulePolicies: inst.schedulePolicies,
           preActions: migratePreActions(inst),
         };
@@ -2012,6 +2025,7 @@ function generateConfig(): MxuConfig {
         enabled: t.enabled,
         optionValues: t.optionValues,
       })),
+      globalOptionValues: inst.globalOptionValues ?? {},
       schedulePolicies: inst.schedulePolicies,
       preActions: inst.preActions,
     })),

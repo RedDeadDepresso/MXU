@@ -17,13 +17,11 @@ export {
 export { OptionEditor } from './OptionEditor';
 export { AddTaskPanel } from './AddTaskPanel';
 export { Toolbar } from './Toolbar';
-export { ScreenshotPanel } from './ScreenshotPanel';
 export { LogsPanel } from './LogsPanel';
 export { SettingsPage } from './SettingsPage';
 export { WelcomeDialog } from './WelcomeDialog';
 export { DeviceSelector } from './DeviceSelector';
 export { ResourceSelector } from './ResourceSelector';
-export { ConnectionPanel } from './ConnectionPanel';
 export { DashboardView } from './DashboardView';
 export { SchedulePanel } from './SchedulePanel';
 export { ContextMenu, useContextMenu, getIcon } from './ContextMenu';

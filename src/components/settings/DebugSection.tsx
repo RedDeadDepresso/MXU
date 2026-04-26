@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 
 import { useAppStore } from '@/stores/appStore';
-import { maaService } from '@/services/maaService';
+
 import { loggers } from '@/utils/logger';
 import { isTauri, getDebugDir, getConfigDir, openDirectory } from '@/utils/paths';
 import { useExportLogs } from '@/utils/useExportLogs';
@@ -75,12 +75,8 @@ export function DebugSection() {
         setMxuVersion(__MXU_VERSION__ || null);
       }
 
-      // maafw 版本（Tauri 直接调用，浏览器走 HTTP API）
-      try {
-        setMaafwVersion(await maaService.getVersion());
-      } catch {
-        setMaafwVersion(null);
-      }
+      // maafw version removed (MaaFramework not used)
+      setMaafwVersion(null);
 
       // 路径信息和系统信息（仅在 Tauri 环境有意义）
       if (isTauri()) {

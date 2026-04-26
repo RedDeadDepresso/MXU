@@ -59,6 +59,8 @@ export interface SavedInstance {
   // 保存的设备信息，用于自动重连
   savedDevice?: SavedDeviceInfo;
   tasks: SavedTask[];
+  // 全局选项值（global_option，跨所有任务共享，如 GamePath）
+  globalOptionValues?: Record<string, import('./interface').OptionValue>;
   // 定时执行策略列表
   schedulePolicies?: SchedulePolicy[];
   preActions?: ActionConfig[];

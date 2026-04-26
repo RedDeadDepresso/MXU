@@ -13,7 +13,7 @@ import {
   GripHorizontal,
 } from 'lucide-react';
 import { useAppStore } from '@/stores/appStore';
-import { maaService } from '@/services/maaService';
+
 import { useResolvedContent } from '@/services/contentResolver';
 import { loggers, generateTaskPipelineOverride } from '@/utils';
 import { getInterfaceLangKey } from '@/i18n';
@@ -171,7 +171,6 @@ export function AddTaskPanel() {
     resolveI18nText,
     language,
     basePath,
-    registerTaskIdName,
     // 新增任务标记
     newTaskNames,
     removeNewTaskName,
@@ -301,21 +300,8 @@ export function AddTaskPanel() {
 
         log.info(`运行中追加特殊任务 ${specialTask.entry}, pipelineOverride:`, pipelineOverride);
 
-        // 调用 PostTask（使用注册表中的 entry）
-        const maaTaskId = await maaService.runTask(
-          instance.id,
-          specialTask.entry,
-          pipelineOverride,
-          addedTask.id,
-        );
-
-        log.info(`特殊任务已追加, maaTaskId:`, maaTaskId);
-
-        // 注册 task_id 与任务名的映射（用于日志显示）
-        registerTaskIdName(
-          maaTaskId,
-          addedTask.customName || t(specialTask.taskDef.label || specialTask.taskName),
-        );
+        // Task hot-append not supported without MaaFramework; task will run on next CLI start
+        log.info('Task queued for next KKAFIO run (hot-append not available).');
       } catch (err) {
         log.error(`追加特殊任务失败:`, err);
       }
@@ -364,20 +350,8 @@ export function AddTaskPanel() {
 
         log.info('运行中追加任务:', task.entry, ', pipelineOverride:', pipelineOverride);
 
-        // 调用 PostTask
-        const maaTaskId = await maaService.runTask(
-          instance.id,
-          task.entry,
-          pipelineOverride,
-          addedTask.id,
-        );
-
-        log.info('任务已追加, maaTaskId:', maaTaskId);
-
-        // 注册 task_id 与任务名的映射（用于日志显示）
-        const taskDisplayName =
-          addedTask.customName || resolveI18nText(task.label, langKey) || addedTask.taskName;
-        registerTaskIdName(maaTaskId, taskDisplayName);
+        // Task hot-append not supported without MaaFramework; task will run on next CLI start
+        log.info('Task queued for next KKAFIO run (hot-append not available).');
       } catch (err) {
         log.error('追加任务失败:', err);
       }

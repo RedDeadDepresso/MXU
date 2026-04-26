@@ -1,4 +1,4 @@
-import { useRef, useEffect, useCallback } from 'react';
+import React, { useRef, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Trash2, Copy, ChevronUp, ChevronDown, Archive, RotateCcw } from 'lucide-react';
 import clsx from 'clsx';
@@ -74,22 +74,17 @@ export function LogsPanel() {
     navigator.clipboard.writeText(text);
   }, [logs]);
 
-  const getLogColor = (type: LogType) => {
+  // KKAFIO log colors — fixed, not theme-dependent
+  // Mirrors Logger.statusColor: INFO=#2d8cf0, SUCCESS=#00c12b, ERROR=#ed3f14, WARNING/agent=#f90
+  const getLogStyle = (type: LogType): React.CSSProperties => {
     switch (type) {
-      case 'success':
-        return 'text-success'; // 跟随主题强调色
-      case 'warning':
-        return 'text-warning';
-      case 'error':
-        return 'text-error';
-      case 'agent':
-        return 'text-text-muted';
-      case 'focus':
-        return 'text-accent'; // 跟随主题强调色
-      case 'info':
-        return 'text-info'; // 跟随主题强调色
-      default:
-        return 'text-text-secondary';
+      case 'success': return { color: '#00c12b' };
+      case 'error':   return { color: '#ed3f14' };
+      case 'warning': return { color: '#f90' };
+      case 'info':    return { color: '#2d8cf0' };
+      case 'focus':   return { color: '#2d8cf0' };
+      case 'agent':   return {}; // muted default
+      default:        return {};
     }
   };
 
@@ -261,8 +256,9 @@ export function LogsPanel() {
                   className={clsx(
                     'py-1.5 px-2 rounded-md flex items-start gap-3',
                     'odd:bg-black/0 even:bg-black/5',
-                    getLogColor(log.type),
+                    log.type === 'agent' && 'text-text-muted',
                   )}
+                  style={getLogStyle(log.type)}
                 >
                   <span className="text-text-muted/90 w-[72px] flex-shrink-0 tabular-nums text-[11px] leading-5">
                     {formatLogTime(log.timestamp, i18n.language)}
@@ -278,8 +274,9 @@ export function LogsPanel() {
                   className={clsx(
                     'py-1.5 px-2 rounded-md flex items-start gap-3',
                     'odd:bg-black/0 even:bg-black/5',
-                    getLogColor(log.type),
+                    log.type === 'agent' && 'text-text-muted',
                   )}
+                  style={getLogStyle(log.type)}
                 >
                   <span className="text-text-muted/90 w-[72px] flex-shrink-0 tabular-nums text-[11px] leading-5">
                     {formatLogTime(log.timestamp, i18n.language)}

@@ -10,6 +10,7 @@ import { getInterfaceLangKey } from '@/i18n';
 import { findSwitchCase } from '@/utils/optionHelpers';
 import { SwitchButton, TextInput, FileInput, TimeInput } from './FormControls';
 import { Tooltip } from './ui/Tooltip';
+import { toast } from 'sonner';
 
 /** 判断 switch 类型的选项是否有子选项 */
 export function switchHasNestedOptions(optionDef: OptionDefinition): boolean {
@@ -40,6 +41,278 @@ function AsyncIcon({
 
   if (!iconUrl) return null;
   return <img src={iconUrl} alt="" className={className} />;
+}
+
+// ============================================================================
+// FolderInput — text field + three-item dropdown menu
+// ============================================================================
+
+interface FolderMenuItem {
+  label: string;
+  disabled?: boolean;
+  danger?: boolean;
+  onClick: () => void;
+}
+
+function FolderInput({
+  value,
+  onChange,
+  placeholder,
+  disabled,
+  menuItems,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  disabled?: boolean;
+  menuItems: FolderMenuItem[];
+}) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  return (
+    <div className="flex gap-2 items-center">
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        disabled={disabled}
+        className="flex-1 min-w-0 px-3 py-1.5 rounded-md bg-bg-primary border border-border text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50 disabled:cursor-not-allowed font-mono"
+      />
+      <div className="relative flex-shrink-0" ref={menuRef}>
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          disabled={disabled}
+          className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-bg-tertiary border border-border text-sm text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors disabled:opacity-50 disabled:cursor-not-allowed select-none"
+          aria-haspopup="menu"
+          aria-expanded={open}
+        >
+          ⋯
+        </button>
+        {open && (
+          <div className="absolute right-0 mt-1 z-50 min-w-[170px] py-1 rounded-lg border border-border bg-bg-secondary shadow-lg">
+            {menuItems.map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                disabled={item.disabled}
+                onClick={() => {
+                  setOpen(false);
+                  item.onClick();
+                }}
+                className={clsx(
+                  'w-full text-left px-3 py-1.5 text-sm transition-colors',
+                  item.disabled
+                    ? 'text-text-muted cursor-not-allowed'
+                    : item.danger
+                      ? 'text-error hover:bg-error/10'
+                      : 'text-text-primary hover:bg-bg-hover',
+                )}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// ClearFolderDialog — inline confirmation with "delete folder itself" checkbox
+// ============================================================================
+
+function ClearFolderDialog({
+  folderPath,
+  onConfirm,
+  onCancel,
+}: {
+  folderPath: string;
+  onConfirm: (deleteFolder: boolean) => void;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation();
+  const [deleteFolder, setDeleteFolder] = useState(false);
+
+  return (
+    <div className="mt-2 p-3 rounded-lg border border-error/40 bg-error/5 space-y-3">
+      <p className="text-sm text-text-primary">
+        {t('options.folder.clearConfirm', 'Send all contents of this folder to the Recycle Bin?')}
+      </p>
+      <p className="text-xs text-text-muted font-mono truncate" title={folderPath}>
+        {folderPath}
+      </p>
+      <label className="flex items-center gap-2 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={deleteFolder}
+          onChange={(e) => setDeleteFolder(e.target.checked)}
+          className="w-4 h-4 accent-error rounded"
+        />
+        <span className="text-sm text-text-secondary">
+          {t('options.folder.clearDeleteFolder', 'Also send the folder itself to the Recycle Bin')}
+        </span>
+      </label>
+      <div className="flex gap-2 justify-end">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="px-3 py-1.5 rounded-md bg-bg-tertiary border border-border text-sm text-text-secondary hover:bg-bg-hover transition-colors"
+        >
+          {t('common.cancel', 'Cancel')}
+        </button>
+        <button
+          type="button"
+          onClick={() => onConfirm(deleteFolder)}
+          className="px-3 py-1.5 rounded-md bg-error text-white text-sm font-medium hover:bg-error/90 transition-colors"
+        >
+          {t('options.folder.clearConfirmBtn', 'Send to Bin')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================================
+// ActionButtonRow — switch-row style layout with a button on the right
+// Handles action_button option type (e.g. GroupChara Copy/Paste steps)
+// ============================================================================
+
+function ActionButtonRow({
+  optionDef,
+  optionLabel,
+  optionDescription,
+  basePath,
+  translations,
+  instanceId,
+  taskId,
+  optionKey: _optionKey,
+  setTaskOptionValue,
+  disabled,
+  isOptionIncompatible,
+  incompatibleReason = '',
+  depth,
+}: {
+  optionDef: import('@/types/interface').ActionButtonOption;
+  optionLabel: string | undefined;
+  optionDescription: string | undefined;
+  basePath: string;
+  translations: Record<string, string> | undefined;
+  instanceId: string;
+  taskId: string;
+  optionKey: string;
+  setTaskOptionValue: (instanceId: string, taskId: string, key: string, value: import('@/types/interface').OptionValue) => void;
+  disabled: boolean;
+  isOptionIncompatible: boolean;
+  incompatibleReason?: string;
+  depth: number;
+}) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+
+  const handleClick = async () => {
+    if (disabled || busy) return;
+    setBusy(true);
+    try {
+      const action = optionDef.action;
+
+      if (action === 'group_chara_copy') {
+        // Read prompt from sibling GroupCharaPrompt option
+        const store = useAppStore.getState();
+        const inst  = store.instances.find((i) => i.id === instanceId);
+        const task  = inst?.selectedTasks.find((tk) => tk.id === taskId);
+        const promptVal = task?.optionValues['GroupCharaPrompt'];
+        const prompt = promptVal?.type === 'textarea' ? promptVal.text : '';
+        const inputVal  = task?.optionValues['InputPath'];
+        const folder = (inputVal?.type === 'folder' && inputVal.path) ? inputVal.path : basePath;
+
+        const { invoke } = await import('@tauri-apps/api/core');
+        const result = await invoke<{ text: string; error: string }>('kkafio_group_chara_export', {
+          cwd: basePath,
+          folder,
+          prompt,
+        });
+        if (result.error) {
+          toast.error(`Copy failed: ${result.error}`);
+        } else {
+          await navigator.clipboard.writeText(result.text);
+          toast.success('Prompt + JSON copied to clipboard');
+        }
+
+      } else if (action === 'group_chara_paste') {
+        const clipText = await navigator.clipboard.readText();
+        if (!clipText.trim()) {
+          toast.error('Clipboard is empty.');
+          return;
+        }
+
+        let clean = clipText.trim();
+        if (clean.startsWith('```')) clean = clean.split('\n').slice(1).join('\n');
+        if (clean.endsWith('```'))   clean = clean.split('\n').slice(0, -1).join('\n');
+        clean = clean.trim();
+
+        try { JSON.parse(clean); } catch {
+          toast.error('Clipboard does not contain valid JSON. Make sure you copied the full LLM response.');
+          return;
+        }
+        setTaskOptionValue(instanceId, taskId, 'GroupCharaResponse', { type: 'textarea', text: clean });
+        toast.success('LLM response saved');
+      }
+    } catch (e) {
+      toast.error(`Action failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const buttonLabel = optionDef.button_label
+    ? (optionDef.button_label.startsWith('$')
+        ? t(optionDef.button_label.slice(1), optionDef.button_label.slice(1))
+        : optionDef.button_label)
+    : optionLabel ?? optionDef.action;
+
+  return (
+    <div className={clsx(
+      'flex items-center justify-between gap-3 rounded-md px-2 py-1.5 -mx-2',
+      depth > 0 && 'ml-4 pl-3 border-l-2 border-border',
+      isOptionIncompatible && 'opacity-60',
+    )}>
+      <div className="min-w-0 flex-1 max-w-[60%]">
+        <OptionLabelWithIncompatible
+          label={optionLabel ?? ""}
+          icon={optionDef.icon}
+          basePath={basePath}
+          incompatibleReason={incompatibleReason}
+        />
+        <OptionDescription
+          description={optionDescription}
+          basePath={basePath}
+          translations={translations}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={disabled || busy}
+        className="flex-shrink-0 px-3 py-1 rounded-md bg-accent text-white text-sm font-medium hover:bg-accent-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+      >
+        {busy ? '…' : buttonLabel}
+      </button>
+    </div>
+  );
 }
 
 interface OptionEditorProps {
@@ -594,6 +867,224 @@ export function OptionEditor({
           );
         })}
       </div>
+    );
+  }
+
+  // ── Folder 类型 ────────────────────────────────────────────────────────────
+  if (optionDef.type === 'folder') {
+    const folderPath = value?.type === 'folder' ? value.path : (optionDef.default ?? '');
+    const [showClearDialog, setShowClearDialog] = useState(false);
+
+    const setPath = (p: string) => {
+      if (!effectiveDisabled) setTaskOptionValue(instanceId, taskId, optionKey, { type: 'folder', path: p });
+    };
+
+    const handleBrowse = async () => {
+      if (effectiveDisabled) return;
+      try {
+        const { open } = await import('@tauri-apps/plugin-dialog');
+        const selected = await open({ directory: true, multiple: false });
+        if (typeof selected === 'string' && selected) setPath(selected);
+      } catch { /* cancelled */ }
+    };
+
+    const handleShowInExplorer = async () => {
+      if (!folderPath) return;
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('open_file', { filePath: folderPath });
+      } catch { /* ignore */ }
+    };
+
+    const handleClearConfirm = async (deleteFolder: boolean) => {
+      setShowClearDialog(false);
+      if (!folderPath) return;
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const result = await invoke<{ ok: boolean; error: string }>('kkafio_trash', {
+          path: folderPath,
+          deleteFolder,
+        });
+        if (!result.ok) {
+          toast.error(`Failed to send to Recycle Bin:\n${result.error}`);
+        } else {
+          toast.success(deleteFolder ? 'Folder sent to Recycle Bin' : 'Folder contents sent to Recycle Bin');
+          if (deleteFolder) setPath('');
+        }
+      } catch (e) {
+        toast.error(`Failed to send to Recycle Bin: ${e}`);
+      }
+    };
+
+    const menuItems = [
+      {
+        label: t('options.folder.showInExplorer', 'Show in Explorer'),
+        disabled: !folderPath,
+        onClick: handleShowInExplorer,
+      },
+      {
+        label: t('options.folder.browse', 'Browse…'),
+        disabled: effectiveDisabled,
+        onClick: handleBrowse,
+      },
+      {
+        label: t('options.folder.clear', 'Clear contents…'),
+        disabled: effectiveDisabled || !folderPath,
+        danger: true,
+        onClick: () => setShowClearDialog(true),
+      },
+    ];
+
+    return (
+      <div className={clsx('space-y-1.5', depth > 0 && 'ml-4 pl-3 border-l-2 border-border', isOptionIncompatible && 'opacity-60')}>
+        <OptionLabelWithIncompatible label={optionLabel} icon={optionDef.icon} basePath={basePath} incompatibleReason={incompatibleReason} />
+        <OptionDescription description={optionDescription} basePath={basePath} translations={translations} />
+        <FolderInput
+          value={folderPath}
+          onChange={setPath}
+          placeholder={optionDef.placeholder ?? t('options.folder.placeholder', 'Select a folder…')}
+          disabled={effectiveDisabled}
+          menuItems={menuItems}
+        />
+        {showClearDialog && folderPath && (
+          <ClearFolderDialog
+            folderPath={folderPath}
+            onConfirm={handleClearConfirm}
+            onCancel={() => setShowClearDialog(false)}
+          />
+        )}
+      </div>
+    );
+  }
+
+  // ── FileList 类型 ─────────────────────────────────────────────────────────
+  if (optionDef.type === 'file_list') {
+    const filePaths: string[] = value?.type === 'file_list' ? value.paths : (optionDef.default ?? []);
+
+    const setFiles = (paths: string[]) => {
+      setTaskOptionValue(instanceId, taskId, optionKey, { type: 'file_list', paths });
+    };
+
+    const handleAdd = async () => {
+      if (effectiveDisabled) return;
+      try {
+        const { open } = await import('@tauri-apps/plugin-dialog');
+        const filterName = optionDef.file_filter?.replace(/\s*\(.*\)/, '') ?? 'Files';
+        const exts = (optionDef.file_filter?.match(/\*\.(\w+)/g) ?? []).map((e) => e.replace('*.', ''));
+        const selected = await open({
+          multiple: true,
+          filters: exts.length ? [{ name: filterName, extensions: exts }] : undefined,
+        });
+        const newPaths = (Array.isArray(selected) ? selected : selected ? [selected] : []) as string[];
+        setFiles([...filePaths, ...newPaths.filter((p) => !filePaths.includes(p))]);
+      } catch { /* cancelled */ }
+    };
+
+    return (
+      <div className={clsx('space-y-1.5', depth > 0 && 'ml-4 pl-3 border-l-2 border-border', isOptionIncompatible && 'opacity-60')}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <OptionLabelWithIncompatible label={optionLabel} icon={optionDef.icon} basePath={basePath} incompatibleReason={incompatibleReason} />
+            <OptionDescription description={optionDescription} basePath={basePath} translations={translations} />
+          </div>
+          <div className="flex gap-1.5 flex-shrink-0">
+            <button
+              type="button"
+              onClick={handleAdd}
+              disabled={effectiveDisabled}
+              className="px-2.5 py-1 rounded-md bg-accent text-white text-xs font-medium hover:bg-accent-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {t('options.fileList.add', 'Add…')}
+            </button>
+            <button
+              type="button"
+              onClick={() => { if (!effectiveDisabled) setFiles([]); }}
+              disabled={effectiveDisabled || filePaths.length === 0}
+              className="px-2.5 py-1 rounded-md bg-bg-tertiary border border-border text-xs text-text-secondary hover:bg-bg-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {t('options.fileList.clearAll', 'Clear All')}
+            </button>
+          </div>
+        </div>
+        {filePaths.length === 0 ? (
+          <div className="py-3 text-center text-sm text-text-muted rounded-md border border-dashed border-border">
+            {t('options.fileList.empty', 'No files added yet')}
+          </div>
+        ) : (
+          <div className="rounded-md border border-border divide-y divide-border overflow-hidden">
+            {filePaths.map((p) => (
+              <div key={p} className="flex items-center gap-2 px-2.5 py-1.5 group hover:bg-bg-hover">
+                {/* Show only the filename, full path on hover tooltip */}
+                <span
+                  className="flex-1 min-w-0 text-xs text-text-secondary font-mono truncate"
+                  title={p}
+                >
+                  {p.replace(/\\/g, '/').split('/').pop() ?? p}
+                  <span className="text-text-muted ml-1 hidden group-hover:inline">
+                    — {p.replace(/\\/g, '/').split('/').slice(0, -1).join('/')}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => { if (!effectiveDisabled) setFiles(filePaths.filter((x) => x !== p)); }}
+                  disabled={effectiveDisabled}
+                  className="flex-shrink-0 w-5 h-5 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 text-text-muted hover:text-error hover:bg-error/10 transition-all text-xs disabled:pointer-events-none"
+                  aria-label="Remove"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── TextArea 类型 ─────────────────────────────────────────────────────────
+  if (optionDef.type === 'textarea') {
+    const text = value?.type === 'textarea' ? value.text : (optionDef.default ?? '');
+
+    const setText = (newText: string) => {
+      if (!effectiveDisabled) setTaskOptionValue(instanceId, taskId, optionKey, { type: 'textarea', text: newText });
+    };
+
+    return (
+      <div className={clsx('space-y-1.5', depth > 0 && 'ml-4 pl-3 border-l-2 border-border', isOptionIncompatible && 'opacity-60')}>
+        <div>
+          <OptionLabelWithIncompatible label={optionLabel} icon={optionDef.icon} basePath={basePath} incompatibleReason={incompatibleReason} />
+          <OptionDescription description={optionDescription} basePath={basePath} translations={translations} />
+        </div>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder={optionDef.placeholder ?? ''}
+          disabled={effectiveDisabled}
+          rows={6}
+          className="w-full px-3 py-2 rounded-md bg-bg-primary border border-border text-sm text-text-primary placeholder:text-text-muted font-mono resize-y focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50 disabled:cursor-not-allowed"
+        />
+      </div>
+    );
+  }
+
+  // ── ActionButton 类型 ────────────────────────────────────────────────────
+  if (optionDef.type === 'action_button') {
+    return (
+      <ActionButtonRow
+        optionDef={optionDef}
+        optionLabel={optionLabel}
+        optionDescription={optionDescription}
+        basePath={basePath}
+        translations={translations}
+        instanceId={instanceId}
+        taskId={taskId}
+        optionKey={optionKey}
+        setTaskOptionValue={setTaskOptionValue}
+        disabled={effectiveDisabled}
+        isOptionIncompatible={isOptionIncompatible}
+        incompatibleReason={incompatibleReason}
+        depth={depth}
+      />
     );
   }
 

@@ -106,6 +106,7 @@ const collectOptionOverrides = (
     }
   } else if (
     optionValue.type === 'input' &&
+    optionDef.type === 'input' &&
     'pipeline_override' in optionDef &&
     optionDef.pipeline_override
   ) {
@@ -155,6 +156,75 @@ const collectOptionOverrides = (
         overrideStr,
       });
     }
+  } else if (optionValue.type === 'folder' && optionDef.type === 'folder') {
+    // Folder picker: substitute {name} placeholder or write directly via pipeline_override
+    const path = optionValue.path;
+    if (optionDef.pipeline_override) {
+      const name = optionDef.name;
+      const placeholder = `{${name}}`;
+      const escaped = placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      let overrideStr = JSON.stringify(optionDef.pipeline_override);
+      overrideStr = overrideStr.replace(
+        new RegExp(`"${escaped}"`, 'g'),
+        JSON.stringify(path),
+      );
+      overrideStr = overrideStr.replace(
+        new RegExp(escaped, 'g'),
+        JSON.stringify(path).slice(1, -1),
+      );
+      try {
+        overrides.push(JSON.parse(overrideStr));
+      } catch (e) {
+        loggers.task.warn('folder option override parse failed:', e);
+      }
+    } else {
+      // Fallback: write {name: path} directly
+      overrides.push({ [optionDef.name]: path });
+    }
+  } else if (optionValue.type === 'file_list' && optionDef.type === 'file_list') {
+    // File list picker: write array of paths
+    const paths = optionValue.paths;
+    if (optionDef.pipeline_override) {
+      const name = optionDef.name;
+      const placeholder = `{${name}}`;
+      const escaped = placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      let overrideStr = JSON.stringify(optionDef.pipeline_override);
+      overrideStr = overrideStr.replace(
+        new RegExp(`"${escaped}"`, 'g'),
+        JSON.stringify(paths),
+      );
+      try {
+        overrides.push(JSON.parse(overrideStr));
+      } catch (e) {
+        loggers.task.warn('file_list option override parse failed:', e);
+      }
+    } else {
+      overrides.push({ [optionDef.name]: paths });
+    }
+  } else if (optionValue.type === 'textarea' && optionDef.type === 'textarea') {
+    // Large text area: write string value
+    const text = optionValue.text;
+    if (optionDef.pipeline_override) {
+      const name = optionDef.name;
+      const placeholder = `{${name}}`;
+      const escaped = placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      let overrideStr = JSON.stringify(optionDef.pipeline_override);
+      overrideStr = overrideStr.replace(
+        new RegExp(`"${escaped}"`, 'g'),
+        JSON.stringify(text),
+      );
+      overrideStr = overrideStr.replace(
+        new RegExp(escaped, 'g'),
+        JSON.stringify(text).slice(1, -1),
+      );
+      try {
+        overrides.push(JSON.parse(overrideStr));
+      } catch (e) {
+        loggers.task.warn('textarea option override parse failed:', e);
+      }
+    } else {
+      overrides.push({ [optionDef.name]: text });
+    }
   }
 };
 
@@ -169,6 +239,7 @@ export const generateTaskPipelineOverride = (
   projectInterface: ProjectInterface | null,
   controllerName?: string,
   resourceName?: string,
+  globalOptionValues?: Record<string, import('@/types/interface').OptionValue>,
 ): string => {
   // 处理 MXU 内置特殊任务
   if (isMxuSpecialTask(selectedTask.taskName)) {
@@ -188,12 +259,17 @@ export const generateTaskPipelineOverride = (
 
   if (projectInterface.option) {
     // v2.3.0 覆盖顺序：global_option → resource.option → controller.option → task.option
-    // 1. 全局选项（优先级最低）
+    // 1. 全局选项 — read from globalOptionValues (instance-level), fall back to task optionValues
     if (projectInterface.global_option) {
       for (const optionKey of projectInterface.global_option) {
+        // Merge: globalOptionValues takes precedence over per-task values
+        const mergedValues = {
+          ...selectedTask.optionValues,
+          ...(globalOptionValues ?? {}),
+        };
         collectOptionOverrides(
           optionKey,
-          selectedTask.optionValues,
+          mergedValues,
           overrides,
           projectInterface.option,
           controllerName,

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   CheckSquare,
@@ -10,32 +10,17 @@ import {
   StopCircle,
   Loader2,
 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '@/stores/appStore';
 import { isTaskCompatible } from '@/stores/helpers';
-import { maaService } from '@/services/maaService';
 import clsx from 'clsx';
-import { loggers, generateTaskPipelineOverride, computeResourcePaths } from '@/utils';
-import { getMxuSpecialTask } from '@/types/specialTasks';
-import type { TaskConfig, ControllerConfig } from '@/types/maa';
-import { normalizeAgentConfigs } from '@/types/interface';
-import { parseWin32ScreencapMethod, parseWin32InputMethod } from '@/types/maa';
+import { loggers } from '@/utils';
 import { SchedulePanel } from './SchedulePanel';
-import type { Instance, TaskItem } from '@/types/interface';
-import { resolveI18nText } from '@/services/contentResolver';
-import { getInterfaceLangKey } from '@/i18n';
-import { PermissionModal } from './toolbar/PermissionModal';
 import { ScheduleButton } from './toolbar/ScheduleButton';
-import {
-  startGlobalCallbackListener,
-  waitForResResult,
-} from '@/components/connection/callbackCache';
 import { scheduleService } from '@/services/scheduleService';
-import { stopInstanceTasks } from '@/services/taskStopService';
 import { isTauri } from '@/utils/paths';
-import { buildPiEnvVars } from '@/utils/piEnv';
 
 const log = loggers.task;
-const PRE_ACTION_CANCELLED_ERROR = 'MXU_PRE_ACTION_CANCELLED';
 
 interface ToolbarProps {
   showAddPanel: boolean;
@@ -43,92 +28,37 @@ interface ToolbarProps {
   className?: string;
 }
 
-// 自动连接阶段
-type AutoConnectPhase = 'idle' | 'searching' | 'connecting' | 'loading_resource';
-
 export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarProps) {
   const { t } = useTranslation();
   const {
     getActiveInstance,
     selectAllTasks,
     collapseAllTasks,
-    updateInstance,
     projectInterface,
     basePath,
-    instanceConnectionStatus,
-    instanceResourceLoaded,
-    setInstanceCurrentTaskId,
-    setInstanceTaskStatus,
-    setInstanceConnectionStatus,
-    setInstanceResourceLoaded,
     selectedController,
     selectedResource,
-    // 定时执行状态
     scheduleExecutions,
-    setScheduleExecution,
-    clearScheduleExecution,
-    // 回调 ID 映射
-    registerCtrlIdName,
-    registerResIdName,
-    registerResBatch,
-    registerTaskIdName,
-    registerEntryTaskName,
-    // 日志
     addLog,
-    // 添加任务面板
-    setShowAddTaskPanel,
-    // 国际化
-    interfaceTranslations,
-    language,
-    // 调试设置
-    tcpCompatMode,
-    // MaaFramework 版本
-    maaVersion,
   } = useAppStore();
 
+  const [isRunning, setIsRunning] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [showSchedulePanel, setShowSchedulePanel] = useState(false);
 
-  // 自动连接状态
-  const [autoConnectPhase, setAutoConnectPhase] = useState<AutoConnectPhase>('idle');
-  const [autoConnectError, setAutoConnectError] = useState<string | null>(null);
-
-  // 权限提示弹窗状态
-  const [showPermissionModal, setShowPermissionModal] = useState(false);
-  const [isRestartingAsAdmin, setIsRestartingAsAdmin] = useState(false);
-  const [preActionControlledInstanceId, setPreActionControlledInstanceId] = useState<string | null>(
-    null,
-  );
-  const preActionControlledInstanceIdRef = useRef<string | null>(null);
-  const preActionStopRequestedRef = useRef(false);
-  const lastStartCancelledRef = useRef(false);
-
   const instance = getActiveInstance();
   const tasks = instance?.selectedTasks || [];
   const anyExpanded = tasks.some((t) => t.expanded);
-
-  // 获取当前语言的翻译
-  const langKey = getInterfaceLangKey(language);
-  const translations = interfaceTranslations[langKey];
-
   const instanceId = instance?.id || '';
-  const isPreActionControlledInstance =
-    Boolean(instanceId) && preActionControlledInstanceId === instanceId;
-  const isStartStopRunning = Boolean(instance?.isRunning) || isPreActionControlledInstance;
 
-  // 检查是否有保存的设备和资源配置（用于权限检查等）
   const currentControllerName =
     selectedController[instanceId] ||
     instance?.controllerName ||
     projectInterface?.controller[0]?.name;
   const currentResourceName =
     selectedResource[instanceId] || instance?.resourceName || projectInterface?.resource[0]?.name;
-  const currentController = projectInterface?.controller.find(
-    (c) => c.name === currentControllerName,
-  );
 
-  // 全选状态仅考虑兼容当前控制器/资源的任务
   const allEnabled = useMemo(() => {
     if (tasks.length === 0) return false;
     const compatibleTasks = tasks.filter((t) => {
@@ -138,8 +68,8 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
     return compatibleTasks.length > 0 && compatibleTasks.every((t) => t.enabled);
   }, [tasks, projectInterface, currentControllerName, currentResourceName]);
 
-  // 只要有启用的任务就可以运行（连接和资源加载会在 startTasksForInstance 中自动处理）
   const canRun = tasks.some((t) => t.enabled);
+  const isDisabled = (tasks.length === 0 || !canRun) && !isRunning;
 
   const handleSelectAll = () => {
     if (!instance) return;
@@ -151,1221 +81,123 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
     collapseAllTasks(instance.id, !anyExpanded);
   };
 
-  /**
-   * 初始化 MaaFramework
-   */
-  const ensureMaaInitialized = async () => {
-    try {
-      await maaService.getVersion();
-      return true;
-    } catch {
-      await maaService.init();
-      return true;
-    }
-  };
-
-  const beginPreActionControl = useCallback(async (targetInstanceId: string) => {
-    await maaService.setPreActionStop(targetInstanceId, false);
-    preActionControlledInstanceIdRef.current = targetInstanceId;
-    preActionStopRequestedRef.current = false;
-    setPreActionControlledInstanceId(targetInstanceId);
-  }, []);
-
-  const endPreActionControl = useCallback(async (targetInstanceId: string) => {
-    if (preActionControlledInstanceIdRef.current === targetInstanceId) {
-      preActionControlledInstanceIdRef.current = null;
-      preActionStopRequestedRef.current = false;
-      setPreActionControlledInstanceId((current) =>
-        current === targetInstanceId ? null : current,
-      );
-    }
-    try {
-      await maaService.setPreActionStop(targetInstanceId, false);
-    } catch (err) {
-      log.warn('清理前置程序停止标记失败:', err);
-    }
-  }, []);
-
-  const throwIfPreActionStopped = useCallback((targetInstanceId: string) => {
-    if (
-      preActionControlledInstanceIdRef.current === targetInstanceId &&
-      preActionStopRequestedRef.current
-    ) {
-      throw new Error(PRE_ACTION_CANCELLED_ERROR);
-    }
-  }, []);
-
-  const waitWithStopCheck = useCallback(
-    async (totalMs: number, targetInstanceId: string) => {
-      const intervalMs = 100;
-      let elapsed = 0;
-      while (elapsed < totalMs) {
-        throwIfPreActionStopped(targetInstanceId);
-        const sleepMs = Math.min(intervalMs, totalMs - elapsed);
-        await new Promise((resolve) => setTimeout(resolve, sleepMs));
-        elapsed += sleepMs;
-      }
-      throwIfPreActionStopped(targetInstanceId);
-    },
-    [throwIfPreActionStopped],
-  );
-
-  /**
-   * 统一任务启动入口 - 供手动启动、定时启动、快捷键启动等场景复用
-   * @param targetInstance 目标实例
-   * @param options 启动选项
-   * @returns 是否成功启动
-   */
-  const startTasksForInstance = useCallback(
-    async (
-      targetInstance: Instance,
-      options?: {
-        /** 定时策略名称（定时执行时传入） */
-        schedulePolicyName?: string;
-        /** 自动连接阶段变化回调（用于 UI 状态更新） */
-        onPhaseChange?: (phase: AutoConnectPhase) => void;
-      },
-    ): Promise<boolean> => {
-      const { schedulePolicyName, onPhaseChange } = options || {};
-      const targetId = targetInstance.id;
-      const targetTasks = targetInstance.selectedTasks || [];
-      lastStartCancelledRef.current = false;
-
-      // 检查是否有启用的任务
-      const enabledTasks = targetTasks.filter((t) => t.enabled);
-      if (enabledTasks.length === 0) {
-        log.warn(`实例 ${targetInstance.name} 没有启用的任务`);
-        return false;
-      }
-
-      // 检查是否正在运行
-      if (targetInstance.isRunning || preActionControlledInstanceIdRef.current === targetId) {
-        log.warn(`实例 ${targetInstance.name} 正在运行中`);
-        return false;
-      }
-
-      // 获取控制器和资源配置
-      const controllerName = selectedController[targetId] || projectInterface?.controller[0]?.name;
-      const resourceName = selectedResource[targetId] || projectInterface?.resource[0]?.name;
-
-      // 过滤掉不兼容当前控制器/资源的任务
-      const compatibleTasks = enabledTasks.filter((t) => {
-        const taskDef = projectInterface?.task.find((td) => td.name === t.taskName);
-        return isTaskCompatible(taskDef, controllerName, resourceName);
-      });
-
-      // 如果有任务因不兼容被跳过，记录警告
-      const compatibleTaskIds = new Set(compatibleTasks.map((t) => t.id));
-      const skippedTasks = enabledTasks.filter((t) => !compatibleTaskIds.has(t.id));
-      if (skippedTasks.length > 0) {
-        log.warn(
-          `实例 ${targetInstance.name}: ${t('taskList.tasksSkippedDueToIncompatibility', { count: skippedTasks.length })}`,
-        );
-        // 向用户显示跳过任务的警告
-        addLog(targetId, {
-          type: 'warning',
-          message: t('taskList.tasksSkippedDueToIncompatibility', { count: skippedTasks.length }),
-        });
-        skippedTasks.forEach((task) => {
-          const taskDef = projectInterface?.task.find((td) => td.name === task.taskName);
-          const taskLabel = taskDef?.label
-            ? resolveI18nText(taskDef.label, translations)
-            : task.taskName;
-
-          // 检查是控制器不兼容还是资源不兼容
-          const isControllerIncompatible =
-            taskDef?.controller &&
-            taskDef.controller.length > 0 &&
-            controllerName &&
-            !taskDef.controller.includes(controllerName);
-
-          const isResourceIncompatible =
-            taskDef?.resource &&
-            taskDef.resource.length > 0 &&
-            resourceName &&
-            !taskDef.resource.includes(resourceName);
-
-          if (isControllerIncompatible) {
-            log.warn(`  - ${t('taskList.taskSkippedController', { taskName: taskLabel })}`);
-          }
-          if (isResourceIncompatible) {
-            log.warn(`  - ${t('taskList.taskSkippedResource', { taskName: taskLabel })}`);
-          }
-        });
-      }
-
-      // 如果所有启用的任务都被过滤掉了，则无法启动
-      if (compatibleTasks.length === 0) {
-        log.warn(`实例 ${targetInstance.name}: ${t('taskList.noCompatibleTasks')}`);
-        // 向用户显示明确的错误信息
-        addLog(targetId, {
-          type: 'error',
-          message: t('taskList.noCompatibleTasks'),
-        });
-        return false;
-      }
-      const controller = projectInterface?.controller.find((c) => c.name === controllerName);
-      const resource = projectInterface?.resource.find((r) => r.name === resourceName);
-      const savedDevice = targetInstance.savedDevice;
-
-      // 检查是否有保存的设备配置
-      const hasSavedDevice = Boolean(
-        savedDevice &&
-        (savedDevice.adbDeviceName ||
-          savedDevice.windowName ||
-          savedDevice.wlrSocketPath ||
-          savedDevice.playcoverAddress),
-      );
-
-      let isTargetConnected = instanceConnectionStatus[targetId] === 'Connected';
-      const isTargetResourceLoaded = instanceResourceLoaded[targetId] || false;
-
-      // 判断是否可以运行：已连接+资源已加载、有保存设备+资源、或有控制器+资源（自动搜索）
-      const canStartTask =
-        (isTargetConnected && isTargetResourceLoaded) ||
-        (hasSavedDevice && resource) ||
-        (controller && resource);
-
-      if (!canStartTask) {
-        log.warn(`实例 ${targetInstance.name} 无法启动：未连接且没有可用的控制器或资源配置`);
-        return false;
-      }
-
-      try {
-        let needsReconnect = false;
-
-        // 收集所有启用且有程序路径的前置程序，按列表顺序执行
-        const allPreActions = (targetInstance.preActions ?? []).filter(
-          (a) => a.enabled && a.program.trim(),
-        );
-        let hasNonWaitForExit = false;
-        let preActionControlStarted = false;
-
-        if (allPreActions.length > 0) {
-          preActionControlStarted = true;
-          await beginPreActionControl(targetId);
-
-          try {
-            for (const preAction of allPreActions) {
-              const programPath = preAction.program.trim();
-              const processName = programPath.split(/[/\\]/).pop() || programPath;
-
-              // 检查是否应跳过已运行的前置程序
-              if (preAction.skipIfRunning) {
-                if (await maaService.isProcessRunning(programPath)) {
-                  log.info(`实例 ${targetInstance.name}: 前置程序已在运行，跳过执行:`, processName);
-                  addLog(targetId, {
-                    type: 'info',
-                    message: t('action.preActionSkipped', { name: processName }),
-                  });
-                  continue;
-                }
-              }
-
-              log.info(`实例 ${targetInstance.name}: 执行前置动作:`, programPath);
-              addLog(targetId, {
-                type: 'info',
-                message: t('action.preActionStartingNamed', { name: processName }),
-              });
-
-              throwIfPreActionStopped(targetId);
-              const exitCode = await maaService.runAction(
-                targetId,
-                programPath,
-                preAction.args,
-                basePath,
-                preAction.waitForExit ?? true,
-                preAction.useCmd ?? false,
-              );
-              throwIfPreActionStopped(targetId);
-
-              if (exitCode !== 0) {
-                log.warn(`实例 ${targetInstance.name}: 前置动作退出码非零:`, exitCode);
-                addLog(targetId, {
-                  type: 'warning',
-                  message: t('action.preActionExitCode', { code: exitCode }),
-                });
-              } else {
-                addLog(targetId, {
-                  type: 'success',
-                  message: t('action.preActionCompletedNamed', { name: processName }),
-                });
-              }
-
-              if (!(preAction.waitForExit ?? true)) {
-                hasNonWaitForExit = true;
-              }
-            }
-
-            // 所有前置程序执行完毕后，如果有任何非等待退出的动作，则等待设备/窗口就绪
-            if (hasNonWaitForExit && controller) {
-              const controllerType = controller.type;
-              const isWindowType = controllerType === 'Win32' || controllerType === 'Gamepad';
-              log.info(`实例 ${targetInstance.name}: 等待${isWindowType ? '窗口' : '设备'}就绪...`);
-              if (isWindowType) {
-                addLog(targetId, {
-                  type: 'info',
-                  message: savedDevice?.windowName
-                    ? t('action.waitingForWindowNamed', { name: savedDevice.windowName })
-                    : t('action.waitingForAnyWindow'),
-                });
-              } else {
-                addLog(targetId, {
-                  type: 'info',
-                  message: savedDevice?.adbDeviceName
-                    ? t('action.waitingForDeviceNamed', { name: savedDevice.adbDeviceName })
-                    : t('action.waitingForAnyDevice'),
-                });
-              }
-              let deviceFound = false;
-              let attempts = 0;
-              const maxAttempts = 300;
-
-              while (!deviceFound && attempts < maxAttempts) {
-                throwIfPreActionStopped(targetId);
-                try {
-                  if (controllerType === 'Adb') {
-                    const devices = await maaService.findAdbDevices();
-                    if (savedDevice?.adbDeviceName) {
-                      deviceFound = devices.some((d) => d.name === savedDevice.adbDeviceName);
-                    } else {
-                      deviceFound = devices.length > 0;
-                    }
-                  } else if (controllerType === 'Win32' || controllerType === 'Gamepad') {
-                    const classRegex =
-                      controller.win32?.class_regex || controller.gamepad?.class_regex;
-                    const windowRegex =
-                      controller.win32?.window_regex || controller.gamepad?.window_regex;
-                    const windows = await maaService.findWin32Windows(classRegex, windowRegex);
-                    if (savedDevice?.windowName) {
-                      deviceFound = windows.some((w) => w.window_name === savedDevice.windowName);
-                    } else {
-                      deviceFound = windows.length > 0;
-                    }
-                  } else if (controllerType === 'WlRoots') {
-                    const sockets = await maaService.findWlrootsSockets();
-                    if (savedDevice?.wlrSocketPath) {
-                      deviceFound = sockets.includes(savedDevice.wlrSocketPath);
-                    } else {
-                      deviceFound = sockets.length > 0;
-                    }
-                  } else {
-                    deviceFound = true;
-                  }
-                } catch (searchErr) {
-                  log.warn(
-                    `实例 ${targetInstance.name}: ${isWindowType ? '窗口' : '设备'}搜索出错:`,
-                    searchErr,
-                  );
-                }
-
-                if (!deviceFound) {
-                  attempts++;
-                  await waitWithStopCheck(1000, targetId);
-                }
-              }
-
-              if (deviceFound) {
-                log.info(`实例 ${targetInstance.name}: ${isWindowType ? '窗口' : '设备'}已就绪`);
-                addLog(targetId, {
-                  type: 'success',
-                  message: isWindowType ? t('action.windowReady') : t('action.deviceReady'),
-                });
-                if (
-                  !savedDevice?.windowName &&
-                  !savedDevice?.adbDeviceName &&
-                  !savedDevice?.wlrSocketPath &&
-                  !savedDevice?.playcoverAddress
-                ) {
-                  try {
-                    if (controllerType === 'Adb') {
-                      const devices = await maaService.findAdbDevices();
-                      if (devices.length > 0) {
-                        addLog(targetId, {
-                          type: 'info',
-                          message: t('taskList.autoConnect.autoSelectedDevice', {
-                            name: devices[0].name || devices[0].address,
-                          }),
-                        });
-                      }
-                    } else if (controllerType === 'Win32' || controllerType === 'Gamepad') {
-                      const classRegex =
-                        controller.win32?.class_regex || controller.gamepad?.class_regex;
-                      const windowRegex =
-                        controller.win32?.window_regex || controller.gamepad?.window_regex;
-                      const windows = await maaService.findWin32Windows(classRegex, windowRegex);
-                      if (windows.length > 0) {
-                        addLog(targetId, {
-                          type: 'info',
-                          message: t('taskList.autoConnect.autoSelectedWindow', {
-                            name: windows[0].window_name || windows[0].class_name,
-                          }),
-                        });
-                      }
-                    } else if (controllerType === 'WlRoots') {
-                      const sockets = await maaService.findWlrootsSockets();
-                      if (sockets.length > 0) {
-                        addLog(targetId, {
-                          type: 'info',
-                          message: t('taskList.autoConnect.autoSelectedDevice', {
-                            name: sockets[0],
-                          }),
-                        });
-                      }
-                    }
-                  } catch {
-                    // 忽略二次搜索错误
-                  }
-                }
-
-                const delaySec = useAppStore.getState().preActionConnectDelaySec ?? 5;
-                if (delaySec > 0) {
-                  log.info(`实例 ${targetInstance.name}: 等待 ${delaySec} 秒后再连接...`);
-                  addLog(targetId, {
-                    type: 'info',
-                    message: t('action.preActionConnectDelay', { seconds: delaySec }),
-                  });
-                  await waitWithStopCheck(delaySec * 1000, targetId);
-                }
-
-                needsReconnect = true;
-              } else {
-                log.warn(`实例 ${targetInstance.name}: 等待${isWindowType ? '窗口' : '设备'}超时`);
-                addLog(targetId, {
-                  type: 'warning',
-                  message: isWindowType
-                    ? t('action.windowWaitTimeout')
-                    : t('action.deviceWaitTimeout'),
-                });
-              }
-            }
-          } catch (err) {
-            if ((err instanceof Error ? err.message : String(err)) === PRE_ACTION_CANCELLED_ERROR) {
-              throw err;
-            }
-            log.error(`实例 ${targetInstance.name}: 前置动作执行失败:`, err);
-            addLog(targetId, {
-              type: 'error',
-              message: t('action.preActionFailed', { error: String(err) }),
-            });
-          } finally {
-            if (preActionControlStarted) {
-              await endPreActionControl(targetId);
-            }
-          }
-        }
-
-        // 前置程序重启了应用，旧连接已失效，重置连接状态以强制重新连接
-        if (needsReconnect && isTargetConnected) {
-          log.info(`实例 ${targetInstance.name}: 前置程序已重启应用，重置连接状态以重新连接`);
-          setInstanceConnectionStatus(targetId, 'Disconnected');
-        }
-
-        // 查询后端真实连接状态，纠正前端可能过时的缓存
-        if (isTargetConnected && !needsReconnect) {
-          const backendState = await maaService.getInstanceState(targetId);
-          if (!backendState || backendState.connectionStatus !== 'Connected') {
-            log.warn(
-              `实例 ${targetInstance.name}: 后端${backendState ? '连接已断开' : '实例不存在'}，但前端缓存为已连接，强制重新连接`,
-            );
-            setInstanceConnectionStatus(targetId, 'Disconnected');
-            isTargetConnected = false;
-          }
-        }
-
-        // 如果未连接（或需要重连），尝试自动连接
-        if ((!isTargetConnected || needsReconnect) && controller) {
-          const controllerType = controller.type;
-
-          await ensureMaaInitialized();
-          await maaService.createInstance(targetId).catch((err) => {
-            log.warn('创建实例失败（可能已存在）:', err);
-          });
-
-          let config: ControllerConfig | null = null;
-          let deviceName = '';
-          let targetType: 'device' | 'window' = 'device';
-
-          if (hasSavedDevice && savedDevice) {
-            // 有保存的设备配置，按名称精确匹配
-            log.info(`实例 ${targetInstance.name}: 自动连接已保存的设备...`);
-            onPhaseChange?.('searching');
-
-            if (controllerType === 'Adb' && savedDevice.adbDeviceName) {
-              const devices = await maaService.findAdbDevices();
-              const matchedDevice = devices.find((d) => d.name === savedDevice.adbDeviceName);
-              if (!matchedDevice) {
-                log.warn(`实例 ${targetInstance.name}: 未找到设备 ${savedDevice.adbDeviceName}`);
-                return false;
-              }
-              config = {
-                type: 'Adb',
-                adb_path: matchedDevice.adb_path,
-                address: matchedDevice.address,
-                screencap_methods: matchedDevice.screencap_methods,
-                input_methods: matchedDevice.input_methods,
-                config: matchedDevice.config,
-              };
-              deviceName = matchedDevice.name || matchedDevice.address;
-              targetType = 'device';
-            } else if (
-              (controllerType === 'Win32' || controllerType === 'Gamepad') &&
-              savedDevice.windowName
-            ) {
-              const classRegex = controller.win32?.class_regex || controller.gamepad?.class_regex;
-              const windowRegex =
-                controller.win32?.window_regex || controller.gamepad?.window_regex;
-              const windows = await maaService.findWin32Windows(classRegex, windowRegex);
-              const matchedWindow = windows.find((w) => w.window_name === savedDevice.windowName);
-              if (!matchedWindow) {
-                log.warn(`实例 ${targetInstance.name}: 未找到窗口 ${savedDevice.windowName}`);
-                return false;
-              }
-              if (controllerType === 'Win32') {
-                config = {
-                  type: 'Win32',
-                  handle: matchedWindow.handle,
-                  screencap_method: parseWin32ScreencapMethod(controller.win32?.screencap || ''),
-                  mouse_method: parseWin32InputMethod(controller.win32?.mouse || ''),
-                  keyboard_method: parseWin32InputMethod(controller.win32?.keyboard || ''),
-                };
-              } else {
-                config = {
-                  type: 'Gamepad',
-                  handle: matchedWindow.handle,
-                };
-              }
-              deviceName = matchedWindow.window_name || matchedWindow.class_name;
-              targetType = 'window';
-            } else if (controllerType === 'WlRoots' && savedDevice.wlrSocketPath) {
-              const sockets = await maaService.findWlrootsSockets();
-              if (!sockets.includes(savedDevice.wlrSocketPath)) {
-                log.warn(
-                  `实例 ${targetInstance.name}: 未找到 WlRoots socket ${savedDevice.wlrSocketPath}`,
-                );
-                return false;
-              }
-              config = {
-                type: 'WlRoots',
-                wlr_socket_path: savedDevice.wlrSocketPath,
-              };
-              deviceName = savedDevice.wlrSocketPath;
-              targetType = 'device';
-            } else if (controllerType === 'PlayCover' && savedDevice.playcoverAddress) {
-              config = {
-                type: 'PlayCover',
-                address: savedDevice.playcoverAddress,
-              };
-              deviceName = savedDevice.playcoverAddress;
-              targetType = 'device';
-            }
-          } else {
-            // 没有保存的设备配置，自动搜索并连接第一个结果
-            log.info(`实例 ${targetInstance.name}: 自动搜索设备并连接...`);
-            onPhaseChange?.('searching');
-
-            if (controllerType === 'Adb') {
-              const devices = await maaService.findAdbDevices();
-              if (devices.length === 0) {
-                log.warn(`实例 ${targetInstance.name}: 未搜索到任何 ADB 设备`);
-                addLog(targetId, {
-                  type: 'error',
-                  message: t('taskList.autoConnect.noDeviceFound'),
-                });
-                return false;
-              }
-              const firstDevice = devices[0];
-              log.info(`实例 ${targetInstance.name}: 自动选择设备: ${firstDevice.name}`);
-              // 没有保存过设备，给出首次自动匹配提示
-              addLog(targetId, {
-                type: 'info',
-                message: t('taskList.autoConnect.autoSelectedDevice', {
-                  name: firstDevice.name || firstDevice.address,
-                }),
-              });
-              config = {
-                type: 'Adb',
-                adb_path: firstDevice.adb_path,
-                address: firstDevice.address,
-                screencap_methods: firstDevice.screencap_methods,
-                input_methods: firstDevice.input_methods,
-                config: firstDevice.config,
-              };
-              deviceName = firstDevice.name || firstDevice.address;
-              targetType = 'device';
-            } else if (controllerType === 'Win32' || controllerType === 'Gamepad') {
-              const classRegex = controller.win32?.class_regex || controller.gamepad?.class_regex;
-              const windowRegex =
-                controller.win32?.window_regex || controller.gamepad?.window_regex;
-              const windows = await maaService.findWin32Windows(classRegex, windowRegex);
-              if (windows.length === 0) {
-                log.warn(`实例 ${targetInstance.name}: 未搜索到任何窗口`);
-                addLog(targetId, {
-                  type: 'error',
-                  message: t('taskList.autoConnect.noWindowFound'),
-                });
-                return false;
-              }
-              const firstWindow = windows[0];
-              log.info(`实例 ${targetInstance.name}: 自动选择窗口: ${firstWindow.window_name}`);
-              // 没有保存过设备，给出首次自动匹配提示
-              addLog(targetId, {
-                type: 'info',
-                message: t('taskList.autoConnect.autoSelectedWindow', {
-                  name: firstWindow.window_name || firstWindow.class_name,
-                }),
-              });
-              if (controllerType === 'Win32') {
-                config = {
-                  type: 'Win32',
-                  handle: firstWindow.handle,
-                  screencap_method: parseWin32ScreencapMethod(controller.win32?.screencap || ''),
-                  mouse_method: parseWin32InputMethod(controller.win32?.mouse || ''),
-                  keyboard_method: parseWin32InputMethod(controller.win32?.keyboard || ''),
-                };
-              } else {
-                config = {
-                  type: 'Gamepad',
-                  handle: firstWindow.handle,
-                };
-              }
-              deviceName = firstWindow.window_name || firstWindow.class_name;
-              targetType = 'window';
-            } else if (controllerType === 'WlRoots') {
-              const sockets = await maaService.findWlrootsSockets();
-              if (sockets.length === 0) {
-                log.warn(`实例 ${targetInstance.name}: 未搜索到任何 WlRoots socket`);
-                addLog(targetId, {
-                  type: 'error',
-                  message: t('taskList.autoConnect.noDeviceFound'),
-                });
-                return false;
-              }
-              const firstSocket = sockets[0];
-              log.info(`实例 ${targetInstance.name}: 自动选择 WlRoots socket: ${firstSocket}`);
-              addLog(targetId, {
-                type: 'info',
-                message: t('taskList.autoConnect.autoSelectedDevice', {
-                  name: firstSocket,
-                }),
-              });
-              config = {
-                type: 'WlRoots',
-                wlr_socket_path: firstSocket,
-              };
-              deviceName = firstSocket;
-              targetType = 'device';
-            } else if (controllerType === 'PlayCover') {
-              // PlayCover 没有搜索功能，无法自动连接
-              log.warn(`实例 ${targetInstance.name}: PlayCover 控制器需要手动配置地址`);
-              addLog(targetId, {
-                type: 'error',
-                message: t('taskList.autoConnect.needConfig'),
-              });
-              return false;
-            }
-          }
-
-          if (!config) {
-            log.warn(`实例 ${targetInstance.name}: 无法构建控制器配置`);
-            return false;
-          }
-
-          onPhaseChange?.('connecting');
-
-          // 收集回调（避免快速连接时错过）
-          const collectedCallbacks: Array<{ message: string; details: { ctrl_id?: number } }> = [];
-          const unsubscribePromise = maaService.onCallback((message, details) => {
-            if (
-              message === 'Controller.Action.Succeeded' ||
-              message === 'Controller.Action.Failed'
-            ) {
-              collectedCallbacks.push({ message, details });
-            }
-          });
-
-          const ctrlId = await maaService.connectController(targetId, config);
-
-          // 注册 ctrl_id 与设备名/类型的映射
-          registerCtrlIdName(ctrlId, deviceName, targetType);
-
-          // 等待初始回调收集器设置完成
-          const unsubscribe = await unsubscribePromise;
-
-          // 等待连接完成
-          const connectResult = await new Promise<boolean>((resolve) => {
-            let resolved = false;
-
-            const cleanup = (unlisten?: () => void) => {
-              unsubscribe();
-              unlisten?.();
-            };
-
-            const timeout = setTimeout(() => {
-              if (!resolved) {
-                log.warn(`实例 ${targetInstance.name}: 连接超时`);
-                cleanup();
-                resolve(false);
-              }
-            }, 30000);
-
-            // 检查已收集的回调
-            const match = collectedCallbacks.find((cb) => cb.details.ctrl_id === ctrlId);
-            if (match) {
-              resolved = true;
-              clearTimeout(timeout);
-              cleanup();
-              if (match.message === 'Controller.Action.Succeeded') {
-                setInstanceConnectionStatus(targetId, 'Connected');
-                resolve(true);
-              } else {
-                resolve(false);
-              }
-              return;
-            }
-
-            // 继续监听新回调
-            maaService.onCallback((message, details) => {
-              if (resolved) return;
-              if (details.ctrl_id !== ctrlId) return;
-              if (
-                message === 'Controller.Action.Succeeded' ||
-                message === 'Controller.Action.Failed'
-              ) {
-                resolved = true;
-                clearTimeout(timeout);
-                cleanup();
-                if (message === 'Controller.Action.Succeeded') {
-                  setInstanceConnectionStatus(targetId, 'Connected');
-                  resolve(true);
-                } else {
-                  resolve(false);
-                }
-              }
-            });
-          });
-
-          if (!connectResult) {
-            log.warn(`实例 ${targetInstance.name}: 连接设备失败`);
-            return false;
-          }
-        }
-
-        // 查询后端真实状态，纠正前端可能过时的缓存
-        const backendState = await maaService.getInstanceState(targetId);
-        if (backendState && !backendState.resourceLoaded && instanceResourceLoaded[targetId]) {
-          log.warn(
-            `实例 ${targetInstance.name}: 后端资源未加载，但前端缓存为已加载，重置缓存并强制重载`,
-          );
-          setInstanceResourceLoaded(targetId, false);
-        }
-        const isResourceReallyLoaded = backendState
-          ? backendState.resourceLoaded
-          : (instanceResourceLoaded[targetId] ?? false);
-
-        // 如果资源未加载，尝试自动加载
-        if (!isResourceReallyLoaded && resource) {
-          log.info(`实例 ${targetInstance.name}: 加载资源...`);
-          onPhaseChange?.('loading_resource');
-
-          // 计算完整的资源路径（包括 controller.attach_resource_path）
-          const resourcePaths = computeResourcePaths(resource, controller, basePath);
-
-          const resIds = await maaService.loadResource(targetId, resourcePaths);
-
-          // 注册 res_id 与资源名的映射
-          const resDisplayName = resolveI18nText(resource.label, translations) || resource.name;
-          registerResBatch(resIds);
-          resIds.forEach((resId) => {
-            registerResIdName(resId, resDisplayName);
-          });
-
-          // 等待资源加载完成（通过 callbackCache 缓存机制，避免竞态丢失回调）
-          const results = await Promise.all(resIds.map((resId) => waitForResResult(resId, 60000)));
-          const loadResult = results.every((r) => r === 'succeeded');
-          if (loadResult) {
-            setInstanceResourceLoaded(targetId, true);
-          }
-
-          if (!loadResult) {
-            log.warn(`实例 ${targetInstance.name}: 资源加载失败`);
-            return false;
-          }
-        }
-
-        onPhaseChange?.('idle');
-
-        // 构建可运行任务列表（排除无法找到定义的任务）
-        // 这确保了 taskConfigs、taskIds 和 runnableTasks 的索引对齐
-        interface RunnableTask {
-          selectedTask: (typeof compatibleTasks)[0];
-          taskDef: NonNullable<ReturnType<typeof getMxuSpecialTask>>['taskDef'] | TaskItem;
-          specialTask: ReturnType<typeof getMxuSpecialTask>;
-        }
-        const runnableTasks: RunnableTask[] = [];
-        for (const selectedTask of compatibleTasks) {
-          const specialTask = getMxuSpecialTask(selectedTask.taskName);
-          const taskDef =
-            specialTask?.taskDef ||
-            projectInterface?.task.find((t) => t.name === selectedTask.taskName);
-          if (!taskDef) {
-            log.warn(`跳过任务 ${selectedTask.taskName}: 未找到任务定义`);
-            continue;
-          }
-          runnableTasks.push({ selectedTask, taskDef, specialTask });
-        }
-
-        if (runnableTasks.length === 0) {
-          log.warn(`实例 ${targetInstance.name}: 没有可执行的任务`);
-          return false;
-        }
-
-        log.info(`实例 ${targetInstance.name}: 开始执行任务, 数量:`, runnableTasks.length);
-
-        // 构建任务配置列表，同时预注册 entry -> taskName 映射（解决时序问题）
-        const taskConfigs: TaskConfig[] = runnableTasks.map(
-          ({ selectedTask, taskDef, specialTask }) => {
-            // 预注册 entry -> taskName 映射，确保回调时能找到任务名
-            // MXU 特殊任务的 label 是 MXU i18n key（如 'specialTask.sleep.label'），需要用 t() 翻译
-            const taskDisplayName =
-              selectedTask.customName ||
-              (specialTask && taskDef.label
-                ? t(taskDef.label)
-                : resolveI18nText(taskDef.label, translations)) ||
-              selectedTask.taskName;
-            registerEntryTaskName(taskDef.entry, taskDisplayName);
-
-            return {
-              entry: taskDef.entry,
-              pipeline_override: generateTaskPipelineOverride(
-                selectedTask,
-                projectInterface,
-                controllerName,
-                resourceName,
-              ),
-              // 传递 selectedTaskId，后端用于建立 maaTaskId -> selectedTaskId 映射
-              selected_task_id: selectedTask.id,
-            };
-          },
-        );
-
-        // 准备 Agent 配置（支持单个或多个 Agent）
-        const agentConfigs = normalizeAgentConfigs(projectInterface?.agent);
-
-        // PI v2.5.0: 构建 Agent 子进程环境变量
-        const piEnvs = agentConfigs?.length
-          ? buildPiEnvVars({
-              projectInterface,
-              controllerName,
-              resourceName,
-              translations,
-              language,
-              maaVersion,
-            })
-          : undefined;
-
-        updateInstance(targetId, { isRunning: true });
-        setInstanceTaskStatus(targetId, 'Running');
-        setShowAddTaskPanel(false);
-
-        // 如果是定时执行，记录状态
-        if (schedulePolicyName) {
-          setScheduleExecution(targetId, {
-            policyName: schedulePolicyName,
-            startTime: Date.now(),
-          });
-        }
-
-        // 任务可能在 startTasks 返回前就瞬时结束，先启动全局回调缓存再提交。
-        await startGlobalCallbackListener();
-
-        // 启动任务
-        const taskIds = await maaService.startTasks(
-          targetId,
-          taskConfigs,
-          agentConfigs,
-          basePath,
-          tcpCompatMode,
-          piEnvs,
-        );
-
-        log.info(`实例 ${targetInstance.name}: 任务已提交, task_ids:`, taskIds);
-
-        // 注册 task_id 与任务名的映射（用于日志显示），后端管理状态
-        taskIds.forEach((maaTaskId, index) => {
-          const runnable = runnableTasks[index];
-          if (runnable) {
-            const { selectedTask, taskDef, specialTask } = runnable;
-            // 注册 task_id 与任务名的映射（使用自定义名称或 label）
-            // MXU 特殊任务的 label 需要用 t() 翻译
-            const taskDisplayName =
-              selectedTask.customName ||
-              (specialTask && taskDef.label
-                ? t(taskDef.label)
-                : resolveI18nText(taskDef.label, translations)) ||
-              selectedTask.taskName;
-            registerTaskIdName(maaTaskId, taskDisplayName);
-          }
-        });
-
-        // 开始任务时折叠所有任务
-        collapseAllTasks(targetId, false);
-
-        return true;
-      } catch (err) {
-        log.error(`实例 ${targetInstance.name}: 任务启动异常:`, err);
-
-        const errMsg = err instanceof Error ? err.message : String(err);
-        const cancelled = errMsg === PRE_ACTION_CANCELLED_ERROR;
-        if (!cancelled) {
-          addLog(targetId, {
-            type: 'error',
-            message: `${t('taskList.autoConnect.startFailed')}: ${errMsg}`,
-          });
-        }
-
-        const failedAgentConfigs = normalizeAgentConfigs(projectInterface?.agent);
-        if (failedAgentConfigs && failedAgentConfigs.length > 0) {
-          for (let i = 0; i < failedAgentConfigs.length; i++) {
-            const agentCfg = failedAgentConfigs[i];
-            const args = agentCfg.child_args?.join(' ') ?? '';
-            const cmd = args ? `${agentCfg.child_exec} ${args}` : agentCfg.child_exec;
-            addLog(targetId, {
-              type: 'warning',
-              message: t('taskList.autoConnect.agentStartParams', {
-                index: i + 1,
-                cmd,
-                cwd: basePath,
-              }),
-            });
-          }
-          try {
-            await maaService.stopAgent(targetId);
-          } catch {
-            // 忽略停止 agent 的错误
-          }
-        }
-
-        updateInstance(targetId, { isRunning: false });
-        setInstanceTaskStatus(targetId, cancelled ? null : 'Failed');
-        setInstanceCurrentTaskId(targetId, null);
-        clearScheduleExecution(targetId);
-        if (cancelled) {
-          lastStartCancelledRef.current = true;
-          setIsStopping(false);
-        }
-
-        return false;
-      }
-    },
-    [
-      projectInterface,
-      basePath,
-      selectedController,
-      selectedResource,
-      instanceConnectionStatus,
-      instanceResourceLoaded,
-      setInstanceConnectionStatus,
-      setInstanceResourceLoaded,
-      updateInstance,
-      setInstanceTaskStatus,
-      setInstanceCurrentTaskId,
-      setScheduleExecution,
-      clearScheduleExecution,
-      setShowAddTaskPanel,
-      addLog,
-      t,
-      beginPreActionControl,
-      endPreActionControl,
-      throwIfPreActionStopped,
-      waitWithStopCheck,
-    ],
-  );
-
-  // 调度服务：使用 ref 保持回调始终指向最新闭包
-  const scheduleTriggerRef = useRef<typeof startTasksForInstance>(startTasksForInstance);
-  scheduleTriggerRef.current = startTasksForInstance;
-
-  const addLogRef = useRef(addLog);
-  addLogRef.current = addLog;
-
-  const tRef = useRef(t);
-  tRef.current = t;
-
+  // Poll kkafio_is_running every second to keep button state in sync
   useEffect(() => {
     if (!isTauri()) return;
-
-    scheduleService.setTriggerCallback(async (inst, policyName, slotLabel, isCompensation) => {
-      const currentT = tRef.current;
-      const currentAddLog = addLogRef.current;
-
-      const msgKey = isCompensation
-        ? 'logs.messages.scheduleCompensating'
-        : 'logs.messages.scheduleStarting';
-
-      currentAddLog(inst.id, {
-        type: 'info',
-        message: currentT(msgKey, { policy: policyName, time: slotLabel }),
-      });
-
-      const started = await scheduleTriggerRef.current(inst, {
-        schedulePolicyName: policyName,
-      });
-
-      if (started) {
-        log.info(`定时任务启动成功: 实例 "${inst.name}"`);
-      } else {
-        log.warn(`定时任务启动失败或跳过: 实例 "${inst.name}"`);
+    const poll = async () => {
+      try {
+        const running = await invoke<boolean>('kkafio_is_running');
+        setIsRunning(running);
+        if (!running) {
+          setIsStarting(false);
+          setIsStopping(false);
+        }
+      } catch {
+        // ignore
       }
+    };
+    poll();
+    const id = window.setInterval(poll, 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
-      return started;
+  const handleStart = useCallback(async () => {
+    if (!canRun) return;
+
+    const cwd = basePath;
+    if (!cwd) {
+      if (instanceId) addLog(instanceId, { type: 'error', message: 'No base path set — cannot start KKAFIO CLI.' });
+      return;
+    }
+
+    // Compute the zero-based index of the active instance so the CLI knows
+    // which instance block to read from the MXU config file.
+    const storeState = useAppStore.getState();
+    const instanceIndex = storeState.instances.findIndex((i) => i.id === instanceId);
+    const safeIndex = instanceIndex >= 0 ? instanceIndex : 0;
+
+    setIsStarting(true);
+    if (instanceId) addLog(instanceId, { type: 'info', message: t('taskList.startingTasks') });
+
+    try {
+      await invoke('kkafio_start', { cwd, instanceIndex: safeIndex });
+      setIsRunning(true);
+      if (instanceId) addLog(instanceId, { type: 'success', message: t('taskList.startTasks') });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error('kkafio_start failed:', err);
+      if (instanceId) addLog(instanceId, { type: 'error', message: msg });
+      setIsRunning(false);
+    } finally {
+      setIsStarting(false);
+    }
+  }, [canRun, basePath, instanceId, addLog, t]);
+
+  const handleStop = useCallback(async () => {
+    setIsStopping(true);
+    if (instanceId) addLog(instanceId, { type: 'info', message: t('taskList.stoppingTasks') });
+    try {
+      await invoke('kkafio_stop');
+      setIsRunning(false);
+      if (instanceId) addLog(instanceId, { type: 'success', message: t('taskList.stopTasks') });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error('kkafio_stop failed:', err);
+      if (instanceId) addLog(instanceId, { type: 'error', message: msg });
+    } finally {
+      setIsStopping(false);
+    }
+  }, [instanceId, addLog, t]);
+
+  const handleStartStop = () => {
+    if (isRunning) handleStop();
+    else handleStart();
+  };
+
+  // Schedule service integration using setTriggerCallback pattern
+  useEffect(() => {
+    scheduleService.setTriggerCallback(async (instance) => {
+      // In KKAFIO mode we just start/stop the CLI for the active instance.
+      // The ScheduleService calls us with the scheduled instance; we check
+      // whether it matches the currently active one before acting.
+      const activeId = useAppStore.getState().activeInstanceId;
+      if (instance.id !== activeId) return false;
+      await handleStart();
+      return true;
     });
-
-    scheduleService.start();
-
     return () => {
-      scheduleService.stop();
       scheduleService.setTriggerCallback(null);
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [handleStart]);
 
-  /**
-   * 检查当前控制器是否需要管理员权限
-   * @returns 如果需要权限且当前不是管理员返回 true
-   */
-  const checkPermissionRequired = async (): Promise<boolean> => {
-    // 检查当前控制器是否设置了 permission_required
-    if (!currentController?.permission_required) {
-      return false;
-    }
-
-    // 检查当前进程是否已经是管理员
-    const isElevated = await maaService.isElevated();
-    if (isElevated) {
-      log.info('当前已是管理员权限');
-      return false;
-    }
-
-    log.info('控制器需要管理员权限，但当前不是管理员');
-    return true;
-  };
-
-  /**
-   * 处理以管理员身份重启
-   */
-  const handleRestartAsAdmin = async () => {
-    setIsRestartingAsAdmin(true);
-    try {
-      await maaService.restartAsAdmin();
-      // 成功的话进程会退出，不会执行到这里
-    } catch (err) {
-      log.error('以管理员身份重启失败:', err);
-      setIsRestartingAsAdmin(false);
-    }
-  };
-
-  /**
-   * 停止任务的统一流程：复用公共 stop helper，保持各入口行为一致
-   * handleStartStop 和 handleStopTasks 共用此逻辑以保持行为一致。
-   */
-  const performStop = async (targetInstanceId: string) => {
-    if (isStopping) return;
-    setIsStopping(true);
-    let keepStoppingForPreAction = false;
-    try {
-      if (preActionControlledInstanceIdRef.current === targetInstanceId) {
-        preActionStopRequestedRef.current = true;
-        try {
-          await maaService.setPreActionStop(targetInstanceId, true);
-          keepStoppingForPreAction = true;
-        } catch (err) {
-          preActionStopRequestedRef.current = false;
-          log.error('发送前置程序停止请求失败:', err);
-          throw err;
-        }
-        return;
-      }
-      const stopped = await stopInstanceTasks(targetInstanceId);
-      if (!stopped) {
-        log.warn('等待任务停止超时，保留运行状态以避免 UI 与实际不一致');
-      }
-    } finally {
-      if (!keepStoppingForPreAction) {
-        setIsStopping(false);
-      }
-    }
-  };
-
-  const handleStartStop = async () => {
-    if (!instance) return;
-
-    if (isStartStopRunning) {
-      // 停止任务
-      try {
-        await performStop(instance.id);
-      } catch (err) {
-        log.error('停止任务失败:', err);
-      }
-    } else {
-      // 启动任务
-      if (!canRun) {
-        log.warn('无法运行任务：没有启用的任务');
-        return;
-      }
-
-      // 检查是否需要管理员权限
-      const needsElevation = await checkPermissionRequired();
-      if (needsElevation) {
-        setShowPermissionModal(true);
-        return;
-      }
-
-      setIsStarting(true);
-      setAutoConnectError(null);
-
-      try {
-        // 调用统一入口启动任务，传入进度回调以更新 UI 状态
-        const success = await startTasksForInstance(instance, {
-          onPhaseChange: setAutoConnectPhase,
-        });
-
-        if (!success && !lastStartCancelledRef.current) {
-          throw new Error(t('taskList.autoConnect.startFailed'));
-        }
-      } catch (err) {
-        log.error('任务启动异常:', err);
-        setAutoConnectError(err instanceof Error ? err.message : String(err));
-        setAutoConnectPhase('idle');
-      } finally {
-        setIsStarting(false);
-      }
-    }
-  };
-
-  const hotkeyStartingRef = useRef(false);
-
-  // 监听来自 App 的全局快捷键事件：F10 开始任务，F11 结束任务
+  // Global hotkey support — F10 start, F11 stop
   useEffect(() => {
-    const handleStartTasks = async (evt: Event) => {
-      if (hotkeyStartingRef.current) return;
+    const onStart = async (evt: Event) => {
       const currentInstance = useAppStore.getState().getActiveInstance();
-      if (!currentInstance) return;
-
-      const detail = (evt as CustomEvent | undefined)?.detail as
-        | { source?: string; combo?: string }
-        | undefined;
-      const combo = detail?.combo || '';
+      if (!currentInstance || isRunning) return;
+      const combo = ((evt as CustomEvent)?.detail as { combo?: string })?.combo || '';
       addLog(currentInstance.id, {
         type: 'info',
-        message: t('logs.messages.hotkeyDetected', {
-          combo,
-          action: t('logs.messages.hotkeyActionStart'),
-        }),
+        message: t('logs.messages.hotkeyDetected', { combo, action: t('logs.messages.hotkeyActionStart') }),
       });
-
-      if (
-        currentInstance.isRunning ||
-        preActionControlledInstanceIdRef.current === currentInstance.id
-      ) {
-        addLog(currentInstance.id, {
-          type: 'error',
-          message: t('logs.messages.hotkeyStartFailed'),
-        });
-        return;
-      }
-
-      // 直接使用从 store 获取的最新 instance，避免闭包捕获旧的 selectedTasks
-      hotkeyStartingRef.current = true;
-      try {
-        const success = await startTasksForInstance(currentInstance, {
-          onPhaseChange: setAutoConnectPhase,
-        });
-        addLog(currentInstance.id, {
-          type: success ? 'success' : 'error',
-          message: success
-            ? t('logs.messages.hotkeyStartSuccess')
-            : t('logs.messages.hotkeyStartFailed'),
-        });
-      } finally {
-        hotkeyStartingRef.current = false;
-      }
+      await handleStart();
     };
-
-    const handleStopTasks = async (evt: Event) => {
-      const storeState = useAppStore.getState();
-      const runningInstance =
-        storeState.instances.find((i) => i.isRunning) ||
-        (preActionControlledInstanceIdRef.current
-          ? storeState.instances.find((i) => i.id === preActionControlledInstanceIdRef.current)
-          : undefined);
-      if (!runningInstance) return;
-      if (isStopping) return;
-
-      const detail = (evt as CustomEvent | undefined)?.detail as
-        | { source?: string; combo?: string }
-        | undefined;
-      const combo = detail?.combo || '';
-      addLog(runningInstance.id, {
+    const onStop = async (evt: Event) => {
+      if (!isRunning || isStopping) return;
+      const combo = ((evt as CustomEvent)?.detail as { combo?: string })?.combo || '';
+      if (instanceId) addLog(instanceId, {
         type: 'info',
-        message: t('logs.messages.hotkeyDetected', {
-          combo,
-          action: t('logs.messages.hotkeyActionStop'),
-        }),
+        message: t('logs.messages.hotkeyDetected', { combo, action: t('logs.messages.hotkeyActionStop') }),
       });
-
-      try {
-        await performStop(runningInstance.id);
-
-        addLog(runningInstance.id, {
-          type: 'success',
-          message: t('logs.messages.hotkeyStopSuccess'),
-        });
-      } catch (err) {
-        log.error('停止任务失败:', err);
-        addLog(runningInstance.id, {
-          type: 'error',
-          message: t('logs.messages.hotkeyStopFailed'),
-        });
-      }
+      await handleStop();
     };
-
-    document.addEventListener('mxu-start-tasks', handleStartTasks);
-    document.addEventListener('mxu-stop-tasks', handleStopTasks);
-
+    document.addEventListener('mxu-start-tasks', onStart);
+    document.addEventListener('mxu-stop-tasks', onStop);
     return () => {
-      document.removeEventListener('mxu-start-tasks', handleStartTasks);
-      document.removeEventListener('mxu-stop-tasks', handleStopTasks);
+      document.removeEventListener('mxu-start-tasks', onStart);
+      document.removeEventListener('mxu-stop-tasks', onStop);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [instance?.id, instance?.isRunning, isStopping]);
-
-  // canRun 只检查是否有启用的任务；运行中时按钮用于停止，不应禁用
-  const isDisabled = (tasks.length === 0 || !canRun) && !isStartStopRunning;
-
-  // 获取启动按钮的文本
-  const getStartButtonText = () => {
-    if (isStarting) {
-      switch (autoConnectPhase) {
-        case 'searching':
-          return t('taskList.autoConnect.searching');
-        case 'connecting':
-          return t('taskList.autoConnect.connecting');
-        case 'loading_resource':
-          return t('taskList.autoConnect.loadingResource');
-        default:
-          return t('taskList.startingTasks');
-      }
-    }
-    return t('taskList.startTasks');
-  };
-
-  // 获取按钮的 title 提示
-  const getButtonTitle = () => {
-    if (autoConnectError) {
-      return autoConnectError;
-    }
-    return undefined;
-  };
+  }, [isRunning, isStopping, handleStart, handleStop, addLog, instanceId, t]);
 
   return (
     <div
@@ -1374,9 +206,8 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
         className,
       )}
     >
-      {/* 左侧工具按钮 */}
+      {/* Left toolbar buttons */}
       <div className="flex items-center gap-1">
-        {/* 全选/取消全选 */}
         <button
           onClick={handleSelectAll}
           disabled={tasks.length === 0}
@@ -1394,7 +225,6 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
           </span>
         </button>
 
-        {/* 展开/折叠 */}
         <button
           onClick={handleCollapseAll}
           disabled={tasks.length === 0}
@@ -1406,17 +236,12 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
           )}
           title={anyExpanded ? t('taskList.collapseAll') : t('taskList.expandAll')}
         >
-          {anyExpanded ? (
-            <ChevronsDownUp className="w-4 h-4" />
-          ) : (
-            <ChevronsUpDown className="w-4 h-4" />
-          )}
+          {anyExpanded ? <ChevronsDownUp className="w-4 h-4" /> : <ChevronsUpDown className="w-4 h-4" />}
           <span className="hidden sm:inline">
             {anyExpanded ? t('taskList.collapseAll') : t('taskList.expandAll')}
           </span>
         </button>
 
-        {/* 添加任务 */}
         <button
           id="add-task-button"
           onClick={onToggleAddPanel}
@@ -1433,39 +258,27 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
         </button>
       </div>
 
-      {/* 右侧执行按钮组 */}
+      {/* Right: schedule + start/stop */}
       <div className="flex items-center gap-2 relative">
-        {/* 定时执行按钮和状态气泡 */}
         <ScheduleButton
           enabledCount={instance?.schedulePolicies?.filter((p) => p.enabled).length || 0}
           scheduleExecution={instance ? scheduleExecutions[instance.id] : null}
           showPanel={showSchedulePanel}
           onToggle={() => setShowSchedulePanel(!showSchedulePanel)}
         />
-
-        {/* 定时执行面板 */}
         {showSchedulePanel && instance && (
           <SchedulePanel instanceId={instance.id} onClose={() => setShowSchedulePanel(false)} />
         )}
 
-        {/* 权限提示弹窗 */}
-        <PermissionModal
-          isOpen={showPermissionModal}
-          isRestarting={isRestartingAsAdmin}
-          onCancel={() => setShowPermissionModal(false)}
-          onRestart={handleRestartAsAdmin}
-        />
-
-        {/* 开始/停止按钮 */}
         <button
           data-role="start-stop-button"
           onClick={handleStartStop}
-          disabled={isDisabled || isStopping || (isStarting && !isStartStopRunning)}
+          disabled={isDisabled || isStopping || (isStarting && !isRunning)}
           className={clsx(
             'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors',
             isStopping
               ? 'bg-warning text-white'
-              : isStartStopRunning
+              : isRunning
                 ? 'bg-error hover:bg-error/90 text-white'
                 : isStarting
                   ? 'bg-success text-white'
@@ -1473,28 +286,15 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
                     ? 'bg-bg-active text-text-tertiary cursor-not-allowed'
                     : 'bg-accent hover:bg-accent-hover text-white',
           )}
-          title={getButtonTitle()}
         >
           {isStopping ? (
-            <>
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span>{t('taskList.stoppingTasks')}</span>
-            </>
-          ) : isStartStopRunning ? (
-            <>
-              <StopCircle className="w-4 h-4" />
-              <span>{t('taskList.stopTasks')}</span>
-            </>
+            <><Loader2 className="w-4 h-4 animate-spin" /><span>{t('taskList.stoppingTasks')}</span></>
+          ) : isRunning ? (
+            <><StopCircle className="w-4 h-4" /><span>{t('taskList.stopTasks')}</span></>
           ) : isStarting ? (
-            <>
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span>{getStartButtonText()}</span>
-            </>
+            <><Loader2 className="w-4 h-4 animate-spin" /><span>{t('taskList.startingTasks')}</span></>
           ) : (
-            <>
-              <Play className="w-4 h-4" />
-              <span>{t('taskList.startTasks')}</span>
-            </>
+            <><Play className="w-4 h-4" /><span>{t('taskList.startTasks')}</span></>
           )}
         </button>
       </div>

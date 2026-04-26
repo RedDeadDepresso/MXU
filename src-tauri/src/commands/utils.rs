@@ -2,176 +2,64 @@
 //!
 //! 提供路径处理和其他通用工具函数
 
-use super::types::{MaaCallbackEvent, MaaState, StateChangedEvent};
 use crate::ws_broadcast::{WsBroadcast, WsEvent};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// 发送回调事件到前端（Tauri WebView + WebSocket 浏览器客户端）
-pub fn emit_callback_event<S: Into<String>>(app: &AppHandle, message: S, details: S) {
-    let message = message.into();
-    let details = details.into();
-
-    // 广播到所有 WebSocket 客户端
-    if let Some(ws) = app.try_state::<Arc<WsBroadcast>>() {
-        ws.send(WsEvent::MaaCallback {
-            message: message.clone(),
-            details: details.clone(),
-        });
-    }
-
-    // 发送到 Tauri WebView
-    let event = MaaCallbackEvent { message, details };
-    if let Err(e) = app.emit("maa-callback", event) {
-        log::error!("Failed to emit maa-callback: {}", e);
-    }
-}
-
-/// 发送实例状态变更事件（双通道：WS 浏览器客户端 + Tauri WebView）
-///
-/// Tauri 端和 WebUI 端都会收到此事件，用于刷新 `isRunning`、连接状态等运行时信息。
-pub fn emit_state_changed(app: &AppHandle, instance_id: &str, kind: &str) {
-    // 广播到所有 WebSocket 客户端
-    if let Some(ws) = app.try_state::<Arc<WsBroadcast>>() {
-        ws.send(WsEvent::StateChanged {
-            instance_id: instance_id.to_string(),
-            kind: kind.to_string(),
-        });
-    }
-
-    // 发送到 Tauri WebView
-    let event = StateChangedEvent {
-        instance_id: instance_id.to_string(),
-        kind: kind.to_string(),
-    };
-    if let Err(e) = app.emit("state-changed", event) {
-        log::error!("Failed to emit state-changed: {}", e);
-    }
-}
-
-/// 处理 MaaFramework 任务回调，在 Rust 侧更新 TaskRunState（单一真相来源）
-///
-/// 应在 tasker sink 中调用，在 `emit_callback_event` 之前处理任务状态变更。
-/// 负责跟踪 Tasker.Task.Starting / Succeeded / Failed，并在所有任务完成后
-/// 更新 `overall_status` 并发射 `tasks-completed` 事件。
-pub fn handle_task_callback(
-    maa_state: &Arc<MaaState>,
-    app: &AppHandle,
-    instance_id: &str,
-    message: &str,
-    details: &str,
-) {
-    let is_started = message == "Tasker.Task.Starting";
-    let is_succeeded = message == "Tasker.Task.Succeeded";
-    let is_failed = message == "Tasker.Task.Failed";
-
-    if !is_started && !is_succeeded && !is_failed {
-        return;
-    }
-
-    // 解析 task_id
-    let task_id: i64 = match serde_json::from_str::<serde_json::Value>(details)
-        .ok()
-        .and_then(|v| v.get("task_id").and_then(|id| id.as_i64()))
-    {
-        Some(id) => id,
-        None => return,
-    };
-
-    let all_done = {
-        let mut instances = match maa_state.instances.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let instance = match instances.get_mut(instance_id) {
-            Some(i) => i,
-            None => return,
-        };
-        let state = &mut instance.task_run_state;
-
-        if is_started {
-            // 任务开始：定位该任务在队列中的索引，更新当前索引和状态
-            if let Some(idx) = state.pending_task_ids.iter().position(|&id| id == task_id) {
-                state.current_task_index = idx;
-            }
-            if let Some(selected_id) = state.mappings.get(&task_id).cloned() {
-                state.statuses.insert(selected_id, "running".to_string());
-            }
-            false // 未完成
-        } else {
-            // 任务成功或失败
-            let status_str = if is_succeeded { "succeeded" } else { "failed" };
-            if let Some(selected_id) = state.mappings.get(&task_id).cloned() {
-                state.statuses.insert(selected_id, status_str.to_string());
-            }
-
-            // 检查所有已入队任务是否均已完成
-            let all_completed = state.pending_task_ids.iter().all(|id| {
-                state
-                    .mappings
-                    .get(id)
-                    .and_then(|sel_id| state.statuses.get(sel_id))
-                    .map(|s| s == "succeeded" || s == "failed")
-                    .unwrap_or(false)
-            });
-
-            if all_completed {
-                let has_failed = state.statuses.values().any(|s| s == "failed");
-                state.overall_status =
-                    Some(if has_failed { "Failed" } else { "Succeeded" }.to_string());
-                instance.task_ids.clear();
-            }
-
-            all_completed
-        }
-    }; // 锁在此处释放
-
-    // 通知前端刷新状态
-    emit_state_changed(app, instance_id, "task-progress");
-    if all_done {
-        emit_state_changed(app, instance_id, "tasks-completed");
-    }
-}
-
 /// 发送配置变更事件（双通道：WS 浏览器客户端 + Tauri WebView）
-///
-/// 各客户端收到后应重新拉取配置并 `importConfig`（需配合 `consumeSelfSave` 跳过自身触发）。
 pub fn emit_config_changed(app: &AppHandle) {
-    // 广播到所有 WebSocket 客户端
     if let Some(ws) = app.try_state::<Arc<WsBroadcast>>() {
         ws.send(WsEvent::ConfigChanged);
     }
-
-    // 发送到 Tauri WebView
     if let Err(e) = app.emit("config-changed-external", ()) {
         log::error!("Failed to emit config-changed-external: {}", e);
     }
 }
 
 /// 获取应用数据目录
-/// - macOS: ~/Library/Application Support/MXU/
-/// - Windows/Linux: exe 所在目录（保持便携式部署）
+/// - Windows: %APPDATA%/KKAFIO
+/// - macOS:   ~/Library/Application Support/KKAFIO
+/// - Linux:   ~/.config/KKAFIO  (XDG_CONFIG_HOME fallback)
 pub fn get_app_data_dir() -> Result<PathBuf, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "windows")]
     {
-        let home = std::env::var("HOME").map_err(|_| "无法获取 HOME 环境变量".to_string())?;
-        let path = PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("MXU");
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| "Cannot read APPDATA environment variable".to_string())?;
+        let path = PathBuf::from(appdata).join("KKAFIO");
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("Cannot create KKAFIO data dir: {}", e))?;
         Ok(path)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
-        // Windows/Linux 保持便携式，使用 exe 所在目录
-        get_exe_directory()
+        let home = std::env::var("HOME")
+            .map_err(|_| "Cannot read HOME environment variable".to_string())?;
+        let path = PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("KKAFIO");
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("Cannot create KKAFIO data dir: {}", e))?;
+        Ok(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Respect XDG_CONFIG_HOME if set, otherwise fall back to ~/.config
+        let config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{}/.config", home)
+        });
+        let path = PathBuf::from(config_home).join("KKAFIO");
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("Cannot create KKAFIO data dir: {}", e))?;
+        Ok(path)
     }
 }
 
 /// 规范化路径：移除冗余的 `.`、处理 `..`、统一分隔符
-/// 使用 Path::components() 解析，不需要路径实际存在
 pub fn normalize_path(path: &str) -> PathBuf {
     use std::path::{Component, Path};
 
@@ -180,9 +68,7 @@ pub fn normalize_path(path: &str) -> PathBuf {
 
     for component in path.components() {
         match component {
-            // 跳过当前目录标记 "."
             Component::CurDir => {}
-            // 处理父目录 ".."：如果栈顶是普通目录则弹出，否则保留
             Component::ParentDir => {
                 if matches!(components.last(), Some(Component::Normal(_))) {
                     components.pop();
@@ -190,12 +76,10 @@ pub fn normalize_path(path: &str) -> PathBuf {
                     components.push(component);
                 }
             }
-            // 保留其他组件（Prefix、RootDir、Normal）
             _ => components.push(component),
         }
     }
 
-    // 重建路径
     components.into_iter().collect()
 }
 
@@ -203,7 +87,6 @@ pub fn normalize_path(path: &str) -> PathBuf {
 pub fn get_logs_dir() -> PathBuf {
     get_app_data_dir()
         .unwrap_or_else(|_| {
-            // 回退到 exe 目录
             let exe_path = std::env::current_exe().unwrap_or_default();
             exe_path
                 .parent()
@@ -222,11 +105,6 @@ pub fn get_exe_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "无法获取 exe 所在目录".to_string())
 }
 
-/// 获取可执行文件所在目录下的 maafw 子目录
-pub fn get_maafw_dir() -> Result<PathBuf, String> {
-    Ok(get_exe_directory()?.join("maafw"))
-}
-
 /// 构建 User-Agent 字符串
 pub fn build_user_agent() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -237,11 +115,6 @@ pub fn build_user_agent() -> String {
 }
 
 /// 构建启动程序的 Command
-///
-/// - 子进程的 stdout/stderr 设为 null，避免继承父进程的标准流。
-/// - 当 `use_cmd` 为 true 时（仅 Windows），通过 `cmd /c` 启动并设置
-///   `CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB` 标志，隐藏控制台窗口
-///   且使子进程脱离父进程 job 对象。
 pub fn build_launch_command(
     program: &str,
     args: &[String],
@@ -264,7 +137,6 @@ pub fn build_launch_command(
         c
     };
 
-    // 不继承父进程的标准流
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
     #[cfg(target_os = "windows")]

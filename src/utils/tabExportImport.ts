@@ -23,10 +23,13 @@ export type ImportError = 'invalid_format' | 'project_mismatch' | 'unsupported_v
 // 仅在 wire 格式中使用，不对外暴露
 
 type WireOptionValue =
-  | { t: 's'; c: string } // select:   caseName
-  | { t: 'cb'; c: string[] } // checkbox: caseNames
-  | { t: 'sw'; v: boolean } // switch:   value
-  | { t: 'in'; v: Record<string, string> }; // input: values
+  | { t: 's'; c: string } // select:    caseName
+  | { t: 'cb'; c: string[] } // checkbox:  caseNames
+  | { t: 'sw'; v: boolean } // switch:    value
+  | { t: 'in'; v: Record<string, string> } // input:     values
+  | { t: 'fo'; v: string } // folder:    path
+  | { t: 'fl'; v: string[] } // file_list: paths
+  | { t: 'ta'; v: string }; // textarea:  text
 
 interface WireTask {
   i: string; // id
@@ -66,6 +69,15 @@ function encodeOptionValue(v: OptionValue): WireOptionValue {
       return { t: 'sw', v: v.value };
     case 'input':
       return { t: 'in', v: v.values };
+    case 'folder':
+      return { t: 'fo', v: v.path };
+    case 'file_list':
+      return { t: 'fl', v: v.paths };
+    case 'textarea':
+      return { t: 'ta', v: v.text };
+    default:
+      // action_button has no stored value — encode as empty select
+      return { t: 's', c: '' };
   }
 }
 
@@ -118,8 +130,14 @@ function decodeOptionValue(w: WireOptionValue): OptionValue {
       return { type: 'switch', value: w.v };
     case 'in':
       return { type: 'input', values: w.v };
+    case 'fo':
+      return { type: 'folder', path: typeof w.v === 'string' ? w.v : '' };
+    case 'fl':
+      return { type: 'file_list', paths: Array.isArray(w.v) ? w.v : [] };
+    case 'ta':
+      return { type: 'textarea', text: typeof w.v === 'string' ? w.v : '' };
     default:
-      throw new Error('invalid_format');
+      return { type: 'select', caseName: '' };
   }
 }
 

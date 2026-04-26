@@ -131,7 +131,7 @@ export interface TaskItem {
   option?: string[];
 }
 
-export type OptionType = 'select' | 'checkbox' | 'input' | 'switch';
+export type OptionType = 'select' | 'checkbox' | 'input' | 'switch' | 'folder' | 'file_list' | 'textarea' | 'action_button';
 
 export interface CaseItem {
   name: string;
@@ -205,7 +205,69 @@ export interface InputOption {
   pipeline_override?: Record<string, unknown>;
 }
 
-export type OptionDefinition = SelectOption | CheckboxOption | SwitchOption | InputOption;
+/** Folder picker — renders a text field with a Browse button.
+ *  The chosen directory path is injected via pipeline_override. */
+export interface FolderOption {
+  type: 'folder';
+  label?: string;
+  description?: string;
+  icon?: string;
+  controller?: string[];
+  resource?: string[];
+  /** Name of the pipeline key this value is written to */
+  name: string;
+  default?: string;
+  placeholder?: string;
+  pipeline_override?: Record<string, unknown>;
+}
+
+/** Multi-file picker — renders a list where users can add/remove file paths.
+ *  The list of paths is injected via pipeline_override. */
+export interface FileListOption {
+  type: 'file_list';
+  label?: string;
+  description?: string;
+  icon?: string;
+  controller?: string[];
+  resource?: string[];
+  name: string;
+  /** Glob-style filter shown in the native file dialog, e.g. "PNG files (*.png)" */
+  file_filter?: string;
+  default?: string[];
+  pipeline_override?: Record<string, unknown>;
+}
+
+/** Large text area — renders a resizable textarea.
+ *  The text is injected via pipeline_override. */
+export interface TextAreaOption {
+  type: 'textarea';
+  label?: string;
+  description?: string;
+  icon?: string;
+  controller?: string[];
+  resource?: string[];
+  name: string;
+  placeholder?: string;
+  default?: string;
+  pipeline_override?: Record<string, unknown>;
+}
+
+/** Action button — renders a switch-row-style button (no value stored).
+ *  Used for one-shot actions like GroupChara Copy/Paste steps. */
+export interface ActionButtonOption {
+  type: 'action_button';
+  label?: string;
+  description?: string;
+  icon?: string;
+  controller?: string[];
+  resource?: string[];
+  /** Identifier used to dispatch the action in OptionEditor */
+  action: string;
+  /** Button label (i18n key or plain string) */
+  button_label?: string;
+}
+
+export type OptionDefinition = SelectOption | CheckboxOption | SwitchOption | InputOption | FolderOption | FileListOption | TextAreaOption | ActionButtonOption;
 
 // 运行时状态类型
 export interface SelectedTask {
@@ -233,6 +295,18 @@ export type OptionValue =
   | {
       type: 'input';
       values: Record<string, string>;
+    }
+  | {
+      type: 'folder';
+      path: string;
+    }
+  | {
+      type: 'file_list';
+      paths: string[];
+    }
+  | {
+      type: 'textarea';
+      text: string;
     };
 
 // 保存的设备信息（运行时使用）
@@ -279,6 +353,8 @@ export interface Instance {
   savedDevice?: SavedDeviceInfo;
   selectedTasks: SelectedTask[];
   isRunning: boolean;
+  // 全局选项值（如 GamePath），跨任务共享
+  globalOptionValues?: Record<string, OptionValue>;
   // 定时执行策略列表
   schedulePolicies?: SchedulePolicy[];
   preActions?: ActionConfig[];

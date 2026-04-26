@@ -11,9 +11,7 @@ import {
   TaskList,
   AddTaskPanel,
   Toolbar,
-  ScreenshotPanel,
   LogsPanel,
-  ConnectionPanel,
 } from '@/components';
 import { BackgroundOverlay } from '@/components/BackgroundOverlay';
 import type { BadPathType } from '@/components';
@@ -25,9 +23,7 @@ import {
   markSelfSave,
   resolveI18nText,
   checkAndPrepareDownload,
-  maaService,
   proxySettingsForUpdateDownload,
-  stopInstanceTasksAndExitApp,
 } from '@/services';
 import { loadIconAsDataUrl } from '@/services/contentResolver';
 import * as wsService from '@/services/wsService';
@@ -55,7 +51,7 @@ async function getGlobalShortcut() {
 import { loggers } from '@/utils/logger';
 import { setBackendPort, getApiBase, apiGet } from '@/utils/backendApi';
 import { getAllLogsFromBackend } from '@/utils/logStdout';
-import { useMaaCallbackLogger, useMaaAgentLogger } from '@/utils/useMaaCallbackLogger';
+import { useKkafioLogger } from '@/utils/useKkafioLogger';
 import { getInterfaceLangKey } from '@/i18n';
 import { applyTheme, resolveThemeMode, registerCustomAccent, clearCustomAccents } from '@/themes';
 import { Toaster } from 'sonner';
@@ -80,9 +76,9 @@ import {
   MIN_LEFT_PANEL_WIDTH,
 } from '@/utils/windowUtils';
 import { LoadingScreen } from './components/app';
-import { ConnectionLostOverlay } from './components/app/ConnectionLostOverlay';
+
 import { WebUIBetaBanner } from './components/app/WebUIBetaBanner';
-import { startGlobalCallbackListener } from './components/connection/callbackCache';
+
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { ScrollText } from 'lucide-react';
 
@@ -154,13 +150,11 @@ function App() {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
 
-  // 启用 MAA 回调日志监听
-  useMaaCallbackLogger();
-  useMaaAgentLogger();
+  // Enable KKAFIO output log listener
+  useKkafioLogger();
 
-  useEffect(() => {
-    void startGlobalCallbackListener().catch(() => {});
-  }, []);
+
+
 
   const {
     setProjectInterface,
@@ -183,7 +177,6 @@ function App() {
     setWindowSize: setWindowSizeStore,
     setWindowPosition: setWindowPositionStore,
     setUpdateInfo,
-    restoreBackendStates,
     setDownloadStatus,
     setDownloadProgress,
     setDownloadSavePath,
@@ -224,7 +217,6 @@ function App() {
       setWindowSize: state.setWindowSize,
       setWindowPosition: state.setWindowPosition,
       setUpdateInfo: state.setUpdateInfo,
-      restoreBackendStates: state.restoreBackendStates,
       setDownloadStatus: state.setDownloadStatus,
       setDownloadProgress: state.setDownloadProgress,
       setDownloadSavePath: state.setDownloadSavePath,
@@ -648,17 +640,6 @@ function App() {
       // 主题已应用、窗口已定位，显示窗口
       showWindow();
 
-      // 从后端恢复 MAA 运行时状态（连接状态、资源加载状态、设备缓存等）
-      try {
-        const backendStates = await maaService.getAllStates();
-        if (backendStates) {
-          restoreBackendStates(backendStates);
-          log.info('已恢复后端状态:', Object.keys(backendStates.instances).length, '个实例');
-        }
-      } catch (err) {
-        log.warn('恢复后端状态失败:', err);
-      }
-
       // 从后端恢复运行日志（跨页面刷新持久化）
       try {
         const backendLogs = await getAllLogsFromBackend();
@@ -707,33 +688,6 @@ function App() {
         log.warn('恢复运行日志失败:', err);
       }
 
-      // 检查 MaaFramework 版本兼容性
-      // 注意：即使完整库加载失败（旧版本缺少某些函数），版本检查仍应工作
-      try {
-        // 尝试初始化，即使失败也会设置 lib_dir
-        try {
-          await maaService.init();
-        } catch (initErr) {
-          log.warn('MaaFramework 初始化失败（可能是版本过低）:', initErr);
-        }
-
-        // 版本检查使用独立的版本获取，不依赖完整库加载
-        const versionCheck = await maaService.checkVersion();
-        if (!versionCheck.is_compatible) {
-          log.warn(
-            'MaaFramework 版本过低:',
-            versionCheck.current,
-            '< 最低要求:',
-            versionCheck.minimum,
-          );
-          setVersionWarning({
-            current: versionCheck.current,
-            minimum: versionCheck.minimum,
-          });
-        }
-      } catch (err) {
-        log.warn('版本检查失败:', err);
-      }
 
       log.info('加载完成, 项目:', result.interface.name);
       setLoadingState('success');
@@ -1131,11 +1085,6 @@ function App() {
             log.info('配置已从后端重新同步');
           }
         }
-        // importConfig 会重置 isRunning，需立即从后端刷新真实状态
-        const backendStates = await maaService.getAllStates();
-        if (backendStates) {
-          useAppStore.getState().restoreBackendStates(backendStates);
-        }
       } catch (err) {
         log.warn('重新拉取配置失败:', err);
       }
@@ -1168,78 +1117,6 @@ function App() {
 
     return () => cleanup?.();
   }, []);
-
-  // 监听 state-changed 事件（后端状态变更后通知刷新，包含任务进度更新）
-  // Tauri 桌面端通过 Tauri 事件接收，浏览器 WebUI 通过 WebSocket 接收
-  // 后端是单一真相来源，所有 kind 统一触发 getAllStates + restoreBackendStates
-  useEffect(() => {
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-    // 追踪防抖窗口内是否收到过任务相关事件（需要同步 isRunning 的事件）
-    let pendingTaskKind = false;
-    let cleanup: (() => void) | undefined;
-
-    const isTaskKind = (kind: string) =>
-      kind === 'task-started' ||
-      kind === 'task-stopped' ||
-      kind === 'task-progress' ||
-      kind === 'tasks-completed';
-
-    const handleStateChanged = (_instanceId: string, kind: string) => {
-      if (isTaskKind(kind)) pendingTaskKind = true;
-      if (debounceTimer) clearTimeout(debounceTimer);
-      const shouldSyncRunning = pendingTaskKind;
-      debounceTimer = setTimeout(async () => {
-        pendingTaskKind = false;
-        try {
-          const backendStates = await maaService.getAllStates();
-          if (backendStates) {
-            // 任务相关事件需要同步 isRunning（跨端同步 + 任务自然完成）
-            // 其他事件（connected/resource-loading）跳过，避免竞态覆盖
-            // 前端已设置的 isRunning（start 流程中前端先于后端设置状态）
-            restoreBackendStates(backendStates, {
-              skipRunningState: !shouldSyncRunning,
-            });
-            log.debug('收到 state-changed，已刷新运行时状态, kind:', kind);
-          }
-        } catch (err) {
-          log.warn('state-changed 后刷新状态失败:', err);
-        }
-      }, 300);
-    };
-
-    if (isTauri()) {
-      let cancelled = false;
-      let unlisten: (() => void) | null = null;
-      void (async () => {
-        try {
-          const { listen } = await import('@tauri-apps/api/event');
-          const dispose = await listen<{ instance_id: string; kind: string }>(
-            'state-changed',
-            (event) => handleStateChanged(event.payload.instance_id, event.payload.kind),
-          );
-          if (cancelled) {
-            dispose();
-            return;
-          }
-          unlisten = dispose;
-        } catch (err) {
-          log.warn('注册 state-changed 监听失败:', err);
-        }
-      })();
-      cleanup = () => {
-        cancelled = true;
-        unlisten?.();
-      };
-    } else {
-      const unlisten = wsService.onStateChanged(handleStateChanged);
-      cleanup = unlisten;
-    }
-
-    return () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      cleanup?.();
-    };
-  }, [restoreBackendStates]);
 
   // 检查 VC++ 运行库缺失（在加载完成后检查）
   const checkVCRedistMissing = useCallback(async () => {
@@ -1630,35 +1507,6 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!isTauri()) return;
-
-    let unlisten: (() => void) | null = null;
-
-    const setupSelfStopListener = async () => {
-      try {
-        unlisten = await maaService.onSelfStopRequested(async ({ instanceId }) => {
-          log.info(`[self-stop#${instanceId}] 收到停止自身请求`);
-          try {
-            const stopped = await stopInstanceTasksAndExitApp(instanceId);
-            if (!stopped) {
-              log.warn(`[self-stop#${instanceId}] 停止超时，取消退出应用`);
-            }
-          } catch (error) {
-            log.error(`[self-stop#${instanceId}] 停止自身流程失败:`, error);
-          }
-        });
-      } catch (error) {
-        log.warn('注册停止自身事件监听失败:', error);
-      }
-    };
-
-    void setupSelfStopListener();
-
-    return () => {
-      if (unlisten) unlisten();
-    };
-  }, []);
 
   const toaster = (
     <Toaster
@@ -1678,7 +1526,7 @@ function App() {
       >
         <BackgroundOverlay imageDataUrl={backgroundImageDataUrl} opacity={backgroundOpacity} />
         <div className="relative z-10 h-full flex flex-col">
-          <ConnectionLostOverlay />
+
           <TitleBar />
           <WebUIBetaBanner />
           {/* 安装确认模态框 - 在设置页面也需要能弹出 */}
@@ -1762,7 +1610,7 @@ function App() {
       <BackgroundOverlay imageDataUrl={backgroundImageDataUrl} opacity={backgroundOpacity} />
       <div className="relative z-10 h-full flex flex-col">
         {/* WebUI 模式下的连接断开覆盖层 */}
-        <ConnectionLostOverlay />
+
 
         {/* 自定义标题栏 */}
         <TitleBar />
@@ -1837,16 +1685,6 @@ function App() {
           <div key="main-view-mobile" className="flex-1 flex flex-col min-h-0 overflow-hidden">
             {/* 可滚动主内容区 */}
             <div className="flex-1 overflow-y-auto">
-              {/* 连接设置 */}
-              <div className="p-2">
-                <ConnectionPanel />
-              </div>
-
-              {/* 实时截图 */}
-              <div className="p-2">
-                <ScreenshotPanel />
-              </div>
-
               {/* 任务列表 */}
               <TaskList />
 
@@ -1934,20 +1772,6 @@ function App() {
                   flexShrink: 1,
                 }}
               >
-                {/* 连接设置和实时截图（可折叠）- 使用 grid 动画 */}
-                <div
-                  className="grid transition-[grid-template-rows] duration-150 ease-out"
-                  style={{ gridTemplateRows: sidePanelExpanded ? '1fr' : '0fr' }}
-                >
-                  <div className="overflow-hidden min-h-0 flex flex-col gap-3">
-                    {/* 连接设置（设备/资源选择） */}
-                    <ConnectionPanel />
-
-                    {/* 实时截图 */}
-                    <ScreenshotPanel />
-                  </div>
-                </div>
-
                 {/* 运行日志 */}
                 <LogsPanel />
               </div>
